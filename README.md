@@ -52,8 +52,23 @@ QC and summary analyses for 4 spatial kinase perturbation slides (~300 kinase ta
 - Knockdown efficiency (Wilcoxon rank-sum, volcano plot)
 - sgRNA+ cell distribution across cell types
 
+### 4. `gp_distance_analysis.ipynb`
+
+WNT5A spatial-expression screening and hierarchical Gaussian-process clustering.
+
+- Fixed-noise constant-versus-RBF GP likelihood-ratio screen over 10,789 genes
+- Benjamini-Hochberg selection at 5% FDR
+- Top-ten posterior predictive GP fits
+- Stabilized weighted-mean centering without variance normalization
+- Four-cluster GPClust/MOHGP fit with ten independent restarts
+- Centered spatial trajectories and separate original-scale cluster profiles
+
 ## Requirements
 
 ```
-numpy scipy pandas matplotlib h5py statsmodels openpyxl gdown
+numpy scipy pandas matplotlib h5py statsmodels openpyxl gdown GPy
 ```
+
+The GP clustering notebook additionally uses the pinned SheffieldML/GPclust
+commit documented in its Setup section and should be run in the isolated
+Python 3.12 environment described there.
