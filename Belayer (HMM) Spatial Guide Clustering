@@ -1,0 +1,351 @@
+import scanpy as sc
+import numpy as np
+import pandas as pd
+import networkx as nx
+from scipy.spatial import KDTree
+from scipy.spatial.distance import pdist
+import matplotlib.pyplot as plt
+
+DATA_PATH = 'adata_withEBclusters.h5ad' 
+RADIUS_VALUES = [50, 100, 150, 200, 300, 500]
+REFERENCE_RADIUS = 100
+N_PERMUTATIONS = 999
+RANDOM_SEED = 42
+ALPHA = 100
+
+adata = sc.read_h5ad(DATA_PATH)
+print(f"Loaded Slide-tag data: {adata.shape[0]} cells x {adata.shape[1]} genes")
+
+# Required inputs
+if 'guides_passing_str' not in adata.obs.columns:
+    raise ValueError("Expected adata.obs['guides_passing_str'] for thresholded guide calls.")
+if 'spatial' not in adata.obsm.keys():
+    raise ValueError("Expected adata.obsm['spatial'] for spatial coordinates.")
+
+guides_str = adata.obs['guides_passing_str'].astype(str).values
+spatial = np.asarray(adata.obsm['spatial'])
+
+
+perturbed_mask = guides_str != ''
+perturbed_idx = np.where(perturbed_mask)[0]
+spatial_perturbed = spatial[perturbed_idx]
+guides_perturbed = guides_str[perturbed_idx]
+
+print(f"Perturbed cells with >=1 high-confidence guide: {len(perturbed_idx)}")
+print(f"Unperturbed cells: {(~perturbed_mask).sum()}")
+print(f"Unique exact guide combinations among perturbed cells: {pd.Series(guides_perturbed).nunique()}")
+
+# Nearest-neighbor scale check
+kdt_all = KDTree(spatial)
+d_nn, _ = kdt_all.query(spatial, k=2)
+nn_dist = d_nn[:, 1]
+print("\nNearest-neighbor distance summary:")
+print(f"  median = {np.median(nn_dist):.2f}")
+print(f"  mean   = {np.mean(nn_dist):.2f}")
+print(f"  95%    = {np.percentile(nn_dist, 95):.2f}")
+
+
+tree_perturbed = KDTree(spatial_perturbed)
+results_by_radius = {}
+component_tables = {}
+
+print("\nRadius sweep:")
+print(f"{'radius':>8} {'edges':>10} {'components':>12} {'multi_cell':>12} {'singletons':>12} {'max_size':>10}")
+
+for radius in RADIUS_VALUES:
+    pairs = list(tree_perturbed.query_pairs(r=radius))
+    G = nx.Graph()
+    G.add_nodes_from(range(len(perturbed_idx)))
+
+    edge_count = 0
+    for i, j in pairs:
+        if guides_perturbed[i] == guides_perturbed[j]:
+            d = np.linalg.norm(spatial_perturbed[i] - spatial_perturbed[j])
+            w = np.exp(-d / ALPHA)
+            G.add_edge(i, j, weight=w)
+            edge_count += 1
+
+    components = list(nx.connected_components(G))
+    comp_sizes = np.array([len(c) for c in components], dtype=int)
+    n_multi = int((comp_sizes > 1).sum())
+    n_single = int((comp_sizes == 1).sum())
+
+    results_by_radius[radius] = {
+        'graph': G,
+        'components': components,
+        'component_sizes': comp_sizes,
+        'n_edges': edge_count,
+        'n_components': len(components),
+        'n_multi_cell': n_multi,
+        'n_singletons': n_single,
+        'max_component_size': int(comp_sizes.max()) if len(comp_sizes) else 0,
+    }
+
+    comp_records = []
+    for component_id, comp in enumerate(components):
+        nodes = sorted(list(comp))
+        global_cells = perturbed_idx[nodes]
+        combo = guides_perturbed[nodes[0]]
+        guides = combo.split(';')
+        targets = sorted(set('-'.join(g.split('-')[:-1]) for g in guides))
+        coords = spatial_perturbed[nodes]
+        centroid = coords.mean(axis=0)
+        max_spread = float(pdist(coords).max()) if len(nodes) > 1 else 0.0
+        comp_records.append({
+            'radius': radius,
+            'component_id': component_id,
+            'size': len(nodes),
+            'guide_combination': combo,
+            'n_guides_in_combination': len(guides),
+            'targets': ';'.join(targets),
+            'n_targets': len(targets),
+            'centroid_x': centroid[0],
+            'centroid_y': centroid[1],
+            'max_spread': max_spread,
+            'cell_barcodes': ';'.join(adata.obs_names[global_cells]),
+        })
+    component_tables[radius] = pd.DataFrame(comp_records)
+
+    print(f"{radius:>8} {edge_count:>10} {len(components):>12} {n_multi:>12} {n_single:>12} {results_by_radius[radius]['max_component_size']:>10}")
+
+
+ref = results_by_radius[REFERENCE_RADIUS]
+ref_components = component_tables[REFERENCE_RADIUS].copy()
+ref_multi = ref_components[ref_components['size'] > 1].sort_values('size', ascending=False)
+
+print(f"\nReference radius = {REFERENCE_RADIUS}")
+print(f"Multi-cell clone clusters: {len(ref_multi)}")
+print(f"Cells in multi-cell clone clusters: {int(ref_multi['size'].sum())}")
+print(f"Largest clone cluster: {int(ref_multi['size'].max()) if len(ref_multi) else 0} cells")
+print("\nTop 15 clone clusters:")
+print(ref_multi[['component_id', 'size', 'guide_combination', 'targets', 'max_spread']].head(15).to_string(index=False))
+
+# Target-level summaries
+ref_target_rows = []
+for target, sub in (
+    ref_multi.assign(target_list=ref_multi['targets'].str.split(';'))
+    .explode('target_list')
+    .groupby('target_list')
+):
+    ref_target_rows.append({
+        'target': target,
+        'n_clone_clusters': len(sub),
+        'total_cells_in_multi_cell_clusters': int(sub['size'].sum()),
+        'max_clone_size': int(sub['size'].max()),
+        'mean_clone_size': float(sub['size'].mean()),
+        'median_clone_size': float(sub['size'].median()),
+    })
+ref_target_df = pd.DataFrame(ref_target_rows).sort_values(
+    'total_cells_in_multi_cell_clusters', ascending=False
+)
+print("\nTarget-level clone summary at reference radius:")
+print(ref_target_df.to_string(index=False))
+
+# Permutation test for spatial coherence
+rng = np.random.default_rng(RANDOM_SEED)
+pairs_ref = list(tree_perturbed.query_pairs(r=REFERENCE_RADIUS))
+observed_total_multi = int(ref_multi['size'].sum())
+observed_n_multi = int(ref['n_multi_cell'])
+observed_max = int(ref['max_component_size'])
+
+perm_total_multi = np.zeros(N_PERMUTATIONS, dtype=int)
+perm_n_multi = np.zeros(N_PERMUTATIONS, dtype=int)
+perm_max = np.zeros(N_PERMUTATIONS, dtype=int)
+
+print(f"\nRunning {N_PERMUTATIONS} permutations for spatial coherence test...")
+for p in range(N_PERMUTATIONS):
+    shuffled = guides_perturbed.copy()
+    rng.shuffle(shuffled)
+    Gp = nx.Graph()
+    Gp.add_nodes_from(range(len(perturbed_idx)))
+    for i, j in pairs_ref:
+        if shuffled[i] == shuffled[j]:
+            Gp.add_edge(i, j)
+    perm_sizes = np.array([len(c) for c in nx.connected_components(Gp)], dtype=int)
+    perm_multi = perm_sizes[perm_sizes > 1]
+    perm_total_multi[p] = int(perm_multi.sum()) if len(perm_multi) else 0
+    perm_n_multi[p] = int(len(perm_multi))
+    perm_max[p] = int(perm_sizes.max()) if len(perm_sizes) else 0
+
+p_total = (np.sum(perm_total_multi >= observed_total_multi) + 1) / (N_PERMUTATIONS + 1)
+p_n_multi = (np.sum(perm_n_multi >= observed_n_multi) + 1) / (N_PERMUTATIONS + 1)
+p_max = (np.sum(perm_max >= observed_max) + 1) / (N_PERMUTATIONS + 1)
+z_total = (observed_total_multi - perm_total_multi.mean()) / perm_total_multi.std(ddof=1)
+z_n_multi = (observed_n_multi - perm_n_multi.mean()) / perm_n_multi.std(ddof=1)
+
+print("\nPermutation test results:")
+print(f"  Total cells in multi-cell clones: observed={observed_total_multi}, "
+      f"null={perm_total_multi.mean():.1f}+/-{perm_total_multi.std(ddof=1):.1f}, "
+      f"z={z_total:.1f}, p={p_total:.4f}")
+print(f"  Number of multi-cell clones: observed={observed_n_multi}, "
+      f"null={perm_n_multi.mean():.1f}+/-{perm_n_multi.std(ddof=1):.1f}, "
+      f"z={z_n_multi:.1f}, p={p_n_multi:.4f}")
+print(f"  Largest clone: observed={observed_max}, "
+      f"null={perm_max.mean():.1f}+/-{perm_max.std(ddof=1):.1f}, p={p_max:.4f}")
+
+# Summary across radii
+radius_summary_rows = []
+for r in RADIUS_VALUES:
+    cs = results_by_radius[r]['component_sizes']
+    multi_cs = cs[cs > 1]
+    radius_summary_rows.append({
+        'radius': r,
+        'n_edges': results_by_radius[r]['n_edges'],
+        'n_components': results_by_radius[r]['n_components'],
+        'n_multi_cell': results_by_radius[r]['n_multi_cell'],
+        'n_singletons': results_by_radius[r]['n_singletons'],
+        'max_component_size': results_by_radius[r]['max_component_size'],
+        'median_multi_cell_size': float(np.median(multi_cs)) if len(multi_cs) else float('nan'),
+        'mean_multi_cell_size': float(np.mean(multi_cs)) if len(multi_cs) else float('nan'),
+    })
+radius_summary = pd.DataFrame(radius_summary_rows)
+print("\nRadius robustness summary:")
+print(radius_summary.to_string(index=False))
+
+radius_summary.to_csv('clone_radius_summary.csv', index=False)
+ref_components.to_csv(f'clone_components_radius_{REFERENCE_RADIUS}.csv', index=False)
+ref_target_df.to_csv(f'clone_target_summary_radius_{REFERENCE_RADIUS}.csv', index=False)
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+
+# spatial map of clone clusters
+ax = axes[0]
+unperturbed_idx = np.where(~perturbed_mask)[0]
+ax.scatter(spatial[unperturbed_idx, 0], spatial[unperturbed_idx, 1],
+           s=1, c='lightgray', alpha=0.25)
+
+singleton_components = [c for c in ref['components'] if len(c) == 1]
+if singleton_components:
+    singleton_nodes = np.array([list(c)[0] for c in singleton_components], dtype=int)
+    singleton_global = perturbed_idx[singleton_nodes]
+    ax.scatter(spatial[singleton_global, 0], spatial[singleton_global, 1],
+               s=3, c='gray', alpha=0.35)
+
+multi_components = [c for c in ref['components'] if len(c) > 1]
+cmap20 = plt.cm.tab20(np.linspace(0, 1, 20))
+for i, comp in enumerate(multi_components):
+    comp_nodes = np.array(sorted(list(comp)), dtype=int)
+    global_idx = perturbed_idx[comp_nodes]
+    ax.scatter(spatial[global_idx, 0], spatial[global_idx, 1],
+               s=7, color=cmap20[i % 20], alpha=0.8)
+ax.set_title(f"Clone clusters (radius={REFERENCE_RADIUS})\n"
+             f"{len(multi_components)} multi-cell components")
+ax.set_xlabel('Spatial X')
+ax.set_ylabel('Spatial Y')
+ax.set_aspect('equal')
+
+# selected targets
+ax = axes[1]
+ax.scatter(spatial[:, 0], spatial[:, 1], s=1, c='lightgray', alpha=0.15)
+selected_targets = ['NRP1', 'ACVR2B', 'FZD3', 'EFNA3', 'BMP7']
+selected_colors = ['red', 'blue', 'green', 'orange', 'purple']
+for target, color in zip(selected_targets, selected_colors):
+    sub = ref_multi[ref_multi['targets'].str.contains(target, regex=False)]
+    for _, row in sub.iterrows():
+        cells = row['cell_barcodes'].split(';')
+        idx = np.where(adata.obs_names.isin(cells))[0]
+        ax.scatter(spatial[idx, 0], spatial[idx, 1],
+                   s=8, color=color, alpha=0.75, label=target)
+handles, labels = ax.get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=9, markerscale=2)
+ax.set_title("Clone clusters colored by target gene")
+ax.set_xlabel('Spatial X')
+ax.set_ylabel('Spatial Y')
+ax.set_aspect('equal')
+
+# radius sweep
+ax = axes[2]
+ax.plot(radius_summary['radius'], radius_summary['n_multi_cell'],
+        marker='o', color='steelblue', linewidth=2, label='Multi-cell clusters')
+ax.set_xlabel('Spatial radius')
+ax.set_ylabel('Number of multi-cell clones', color='steelblue')
+ax.tick_params(axis='y', labelcolor='steelblue')
+ax.grid(alpha=0.3)
+ax2 = ax.twinx()
+ax2.plot(radius_summary['radius'], radius_summary['max_component_size'],
+         marker='s', color='darkred', linewidth=2, label='Largest clone')
+ax2.set_ylabel('Largest clone size (cells)', color='darkred')
+ax2.tick_params(axis='y', labelcolor='darkred')
+lines1, labels1 = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labels1 + labels2, loc='center right', fontsize=10)
+ax.set_title("Radius sensitivity")
+
+plt.tight_layout()
+plt.savefig('spatial_lineage_clone_analysis.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# clone size distributions
+fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+for ax, radius in zip(axes.ravel(), RADIUS_VALUES):
+    sizes = results_by_radius[radius]['component_sizes']
+    multi_sizes = sizes[sizes > 1]
+    if len(multi_sizes):
+        bins = np.arange(2, multi_sizes.max() + 2)
+        ax.hist(multi_sizes, bins=bins, color='steelblue', alpha=0.85, edgecolor='white')
+    ax.set_title(f"Radius = {radius}")
+    ax.set_xlabel('Clone cluster size')
+    ax.set_ylabel('Count')
+    ax.set_xlim(1.5, max(60, int(results_by_radius[radius]['max_component_size']) + 1))
+plt.suptitle("Clone cluster size distributions across radii", fontsize=14, y=1.02)
+plt.tight_layout()
+plt.savefig('spatial_lineage_clone_size_distributions.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\nDone! Saved outputs:")
+print("  spatial_lineage_clone_analysis.png")
+print("  spatial_lineage_clone_size_distributions.png")
+print("  clone_radius_summary.csv")
+print(f"  clone_components_radius_{REFERENCE_RADIUS}.csv")
+print(f"  clone_target_summary_radius_{REFERENCE_RADIUS}.csv")
+ref_components = component_tables[REFERENCE_RADIUS].copy()
+
+# expand targets
+expanded = ref_components.assign(
+    target_list=ref_components['targets'].str.split(';')
+).explode('target_list')
+
+# aggregate
+target_summary = expanded.groupby('target_list').agg(
+    total_cells=('size', 'sum'),
+    n_clusters=('component_id', 'count'),
+    max_clone_size=('size', 'max')
+).sort_values('total_cells', ascending=False)
+
+# Select top N
+TOP_N = 5
+top_targets = target_summary.head(TOP_N).index.tolist()
+
+print("Top targets:", top_targets)
+
+def plot_target_components(target):
+    plt.figure(figsize=(6,6))
+
+    plt.scatter(spatial[:,0], spatial[:,1], s=1, c='lightgray', alpha=0.15)
+
+    comps = ref_components[
+        ref_components['targets'].str.contains(target, regex=False)
+    ]
+
+    colors = plt.cm.tab20(np.linspace(0,1,20))
+
+    for i, row in enumerate(comps.itertuples()):
+        cells = row.cell_barcodes.split(';')
+        idx = np.where(adata.obs_names.isin(cells))[0]
+
+        plt.scatter(
+            spatial[idx,0],
+            spatial[idx,1],
+            s=1,
+            color=colors[i % 20],
+            alpha=0.85
+        )
+
+    plt.title(f"{target} clone components")
+    plt.gca().set_aspect('equal')
+    plt.xlabel("X"); plt.ylabel("Y")
+    plt.show()
+
+for t in top_targets[:3]:
+    plot_target_components(t)
