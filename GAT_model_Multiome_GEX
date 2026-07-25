@@ -1,0 +1,431 @@
+from __future__ import annotations
+import copy, json, random
+from pathlib import Path
+import numpy as np, pandas as pd, scipy.sparse as sp
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from scipy.spatial import cKDTree
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+from torch_geometric.utils import scatter
+
+
+DATASET_KIND = "multiome"  
+MODEL_KIND = "context"       
+DATA_PATH = Path("/scratch/welchjd_root/welchjd1/javidgmh/15515_Multiome/catatac_work/motif_analysis/all_lanes_merged_CATATAC_QC_RNA_processed_EB_manual_clustering_cell_types.h5mu")
+OUTDIR = Path("multiome_cell_type_context_gat_NB")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+COUNTS_LAYER = "counts"
+SPATIAL_KEY = "X_spatial"
+EB_KEY = "EB_manual_clustering"
+CELL_TYPE_KEY = "cell_type"
+GUIDE_SOURCE_COL = "guides_passing_str"
+N_HVGS = 1000
+RADIUS = 75.0
+DISTANCE_DECAY = 50.0
+VAL_EB = None
+TEST_EB = None
+SPLIT_SEED = 42
+SEEDS = [17, 42, 89]
+MAX_EPOCHS = 500
+EARLY_STOPPING_PATIENCE = 20
+LR_PATIENCE = 6
+LEARNING_RATE = 0.003
+WEIGHT_DECAY = 1e-5
+DROPOUT = 0.25
+OWN_DIM = 128
+SPATIAL_DIM = 128
+CONTEXT_DIM = 32
+DECODER_HIDDEN = 64
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def seed_all(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+
+def dense32(x):
+    return x.toarray().astype(np.float32) if sp.issparse(x) else np.asarray(x, dtype=np.float32)
+
+
+def get_counts(adata):
+    x = adata.layers[COUNTS_LAYER] if COUNTS_LAYER in adata.layers else adata.X
+    return x.tocsr().astype(np.float32) if sp.issparse(x) else sp.csr_matrix(np.asarray(x, dtype=np.float32))
+
+
+def parse_guides(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)): return []
+    if isinstance(v, (list, tuple, np.ndarray)): vals = v
+    else:
+        s = str(v).strip()
+        if s == "" or s.lower() in {"nan","none","unassigned","no guide","no_guide"}: return []
+        vals = s.split(";")
+    return [str(x).strip() for x in vals if str(x).strip()]
+
+
+def build_guides(obs):
+    if GUIDE_SOURCE_COL not in obs: raise KeyError(f"Missing obs[{GUIDE_SOURCE_COL!r}]")
+    rows = [parse_guides(v) for v in obs[GUIDE_SOURCE_COL].astype(object).to_numpy()]
+    names = sorted({g for row in rows for g in row})
+    if not names: raise ValueError("No guides parsed")
+    lookup = {g:i for i,g in enumerate(names)}
+    X = np.zeros((len(rows), len(names)), np.float32)
+    for i,row in enumerate(rows):
+        for g in row: X[i, lookup[g]] = 1.0
+    return X, names
+
+
+def choose_split(labels):
+    u = np.asarray(pd.unique(labels), dtype=object)
+    if len(u) < 3: raise ValueError("Need at least 3 EBs")
+    rng = np.random.default_rng(SPLIT_SEED); rng.shuffle(u)
+    te = TEST_EB if TEST_EB is not None else u[0]
+    va = VAL_EB if VAL_EB is not None else next(x for x in u if x != te)
+    trm = (labels != te) & (labels != va); vam = labels == va; tem = labels == te
+    return trm, vam, tem, va, te
+
+
+def select_hvgs(counts_train, n):
+    totals = np.asarray(counts_train.sum(1)).ravel()
+    norm = counts_train.multiply((1e4 / np.maximum(totals, 1.0))[:,None]).tocsr(); norm.data = np.log1p(norm.data)
+    m = np.asarray(norm.mean(0)).ravel(); v = np.asarray(norm.power(2).mean(0)).ravel() - m*m
+    detected = np.asarray((counts_train > 0).sum(0)).ravel() >= 10; v[~detected] = -np.inf
+    return np.sort(np.argsort(v)[-min(n, np.isfinite(v).sum()):]).astype(int)
+
+
+def build_graph(coords, labels):
+    ss=[]; dd=[]; ww=[]
+    for eb in pd.unique(labels):
+        idx=np.flatnonzero(labels==eb)
+        if len(idx)<2: continue
+        pairs=cKDTree(coords[idx,:2]).query_pairs(RADIUS, output_type='ndarray')
+        if pairs.size==0: continue
+        u,v=idx[pairs[:,0]],idx[pairs[:,1]]
+        dist=np.linalg.norm(coords[u,:2]-coords[v,:2],axis=1).astype(np.float32)
+        keep=dist>0; u,v,dist=u[keep],v[keep],dist[keep]
+        ss.extend([u,v]); dd.extend([v,u]); ww.extend([dist,dist])
+    if not ss: raise RuntimeError("No graph edges")
+    return torch.tensor(np.vstack([np.concatenate(ss),np.concatenate(dd)]),dtype=torch.long), torch.tensor(np.concatenate(ww)[:,None],dtype=torch.float32)
+
+
+def neighbor_context(celltype_onehot, edge_index):
+    src,dst=edge_index
+    vals=torch.tensor(celltype_onehot,dtype=torch.float32)
+    summed=scatter(vals[src],dst,dim=0,dim_size=len(vals),reduce='sum')
+    deg=scatter(torch.ones((src.numel(),1)),dst,dim=0,dim_size=len(vals),reduce='sum')
+    return (summed/deg.clamp_min(1)).numpy().astype(np.float32)
+
+
+def negative_binomial_nll(residual,y,logN,mu0,raw_theta):
+    # NB2 parameterization: Var(Y_cg) = mu_cg + mu_cg^2 / theta_g
+    # theta_g is positive, gene-specific, learned jointly with the model and shared across cells
+    logmu=(residual+logN[:,None]+mu0[None,:]).clamp(-12,12)
+    mu=torch.exp(logmu)
+    theta=F.softplus(raw_theta)+1e-4
+    logtheta=torch.log(theta)
+    log_theta_plus_mu=torch.logaddexp(logtheta[None,:],logmu)
+    log_prob=(
+        torch.lgamma(y+theta[None,:])
+        -torch.lgamma(theta[None,:])
+        -torch.lgamma(y+1)
+        +theta[None,:]*(logtheta[None,:]-log_theta_plus_mu)
+        +y*(logmu-log_theta_plus_mu)
+    )
+    return -log_prob.mean()
+
+
+def make_mu(residual,logN,mu0):
+    return torch.exp((residual+logN[:,None]+mu0[None,:]).clamp(-12,12))
+
+
+def metrics(y,mu):
+    yt=np.asarray(y,float).ravel(); yp=np.asarray(mu,float).ravel(); ok=np.isfinite(yt)&np.isfinite(yp); yt,yp=yt[ok],yp[ok]
+    xl=np.log1p(yt); yl=np.log1p(np.clip(yp,0,None))
+    return dict(raw_pearson=float(pearsonr(yt,yp).statistic),raw_spearman=float(spearmanr(yt,yp).statistic),
+                raw_rmse=float(np.sqrt(mean_squared_error(yt,yp))),raw_mae=float(mean_absolute_error(yt,yp)),
+                log1p_pearson=float(pearsonr(xl,yl).statistic),log1p_spearman=float(spearmanr(xl,yl).statistic),
+                log1p_rmse=float(np.sqrt(mean_squared_error(xl,yl))),log1p_mae=float(mean_absolute_error(xl,yl)),n_cell_gene=len(yt))
+
+
+def save_hexbin(y,mu,title,path):
+    m=metrics(y,mu); x=np.log1p(np.asarray(y).ravel()); z=np.log1p(np.clip(np.asarray(mu).ravel(),0,None)); lim=max(np.percentile(x,99.9),np.percentile(z,99.9),1e-6)
+    fig,ax=plt.subplots(figsize=(6.2,5.6)); hb=ax.hexbin(x,z,gridsize=80,mincnt=1,norm=LogNorm(),cmap='viridis')
+    ax.plot([0,lim],[0,lim],'--',color='black',label='Perfect prediction'); ax.set_xlim(0,lim); ax.set_ylim(0,lim)
+    ax.set_xlabel('log1p(true held-out counts)'); ax.set_ylabel('log1p(predicted mean)')
+    ax.set_title(f"{title}\nPearson r={m['log1p_pearson']:.3f}, RMSE={m['log1p_rmse']:.3f}, MAE={m['log1p_mae']:.3f}")
+    ax.legend(frameon=False); fig.colorbar(hb,ax=ax).set_label('Cell x gene observations'); fig.tight_layout(); fig.savefig(path,dpi=300,bbox_inches='tight'); plt.close(fig)
+
+
+if DATASET_KIND == 'multiome':
+    import mudata as mu
+    mu.set_options(pull_on_update=False)
+    mdata=mu.read_h5mu(DATA_PATH)
+    adata=mdata.mod['rna'].copy()
+else:
+    import anndata as ad
+    adata=ad.read_h5ad(DATA_PATH)
+
+counts=get_counts(adata); coords=dense32(adata.obsm[SPATIAL_KEY]); eb=adata.obs[EB_KEY].astype(str).to_numpy()
+guides,guide_names=build_guides(adata.obs)
+ct_df=pd.get_dummies(adata.obs[CELL_TYPE_KEY].astype(str),dtype=np.float32); ct=ct_df.to_numpy(np.float32); ct_names=list(map(str,ct_df.columns))
+Xnp=np.concatenate([guides,ct],axis=1).astype(np.float32)
+tr_np,va_np,te_np,val_eb,test_eb=choose_split(eb)
+hvg_idx=select_hvgs(counts[tr_np],N_HVGS); Ynp=counts[:,hvg_idx].toarray().astype(np.float32); gene_names=np.asarray(adata.var_names.astype(str))[hvg_idx]
+lib=np.asarray(counts.sum(1)).ravel().astype(np.float32)
+if np.any(lib<=0): raise ValueError('Non-positive library size')
+logNnp=np.log(lib).astype(np.float32); freq=Ynp[tr_np].sum(0,dtype=np.float64)/lib[tr_np].sum(dtype=np.float64); mu0np=np.log(np.clip(freq,1e-12,None)).astype(np.float32)
+ei_cpu,dist_cpu=build_graph(coords,eb); Cnp=neighbor_context(ct,ei_cpu)
+X=torch.tensor(Xnp,dtype=torch.float32,device=DEVICE); C=torch.tensor(Cnp,dtype=torch.float32,device=DEVICE); Y=torch.tensor(Ynp,dtype=torch.float32,device=DEVICE)
+logN=torch.tensor(logNnp,dtype=torch.float32,device=DEVICE); mu0=torch.tensor(mu0np,dtype=torch.float32,device=DEVICE); ei=ei_cpu.to(DEVICE); dist=dist_cpu.to(DEVICE)
+tr=torch.tensor(tr_np,dtype=torch.bool,device=DEVICE); va=torch.tensor(va_np,dtype=torch.bool,device=DEVICE); te=torch.tensor(te_np,dtype=torch.bool,device=DEVICE)
+print('Device',DEVICE,'cells',adata.n_obs,'guides',guides.shape[1],'cell types',ct.shape[1],'HVGs',len(hvg_idx),'edges',ei.shape[1]); print('val EB',val_eb,'test EB',test_eb)
+
+
+# Models
+class MatchedMLP(nn.Module):
+    def __init__(self,d,out):
+        super().__init__(); self.proj=nn.Linear(d,OWN_DIM,bias=False)
+        self.raw_theta=nn.Parameter(torch.full((out,),10.0))
+        self.dec=nn.Sequential(nn.ELU(),nn.Dropout(DROPOUT),nn.Linear(OWN_DIM,DECODER_HIDDEN),nn.ELU(),nn.Dropout(DROPOUT),nn.Linear(DECODER_HIDDEN,DECODER_HIDDEN),nn.ELU(),nn.Linear(DECODER_HIDDEN,out))
+    def forward(self,x): return self.dec(self.proj(x))
+
+class ConcatResidualGAT(nn.Module):
+    def __init__(self,d,out):
+        super().__init__(); self.own=nn.Linear(d,OWN_DIM,bias=False)
+        self.raw_theta=nn.Parameter(torch.full((out,),10.0))
+        self.spatial=GATConv(d,SPATIAL_DIM//2,heads=2,concat=True,dropout=DROPOUT,add_self_loops=True,bias=False,edge_dim=1,fill_value=1.0)
+        self.dec=nn.Sequential(nn.Linear(OWN_DIM+SPATIAL_DIM,DECODER_HIDDEN),nn.ELU(),nn.Dropout(DROPOUT),nn.Linear(DECODER_HIDDEN,DECODER_HIDDEN),nn.ELU(),nn.Linear(DECODER_HIDDEN,out))
+    def forward(self,x,ei,dist,C):
+        own=F.elu(self.own(x)); spatial=F.elu(self.spatial(x,ei,edge_attr=torch.exp(-dist/DISTANCE_DECAY)))
+        return self.dec(F.dropout(torch.cat([own,spatial],1),DROPOUT,training=self.training))
+
+class CellTypeContextGAT(nn.Module):
+    def __init__(self,d,cdim,out):
+        super().__init__(); self.own=nn.Linear(d,OWN_DIM,bias=False)
+        self.raw_theta=nn.Parameter(torch.full((out,),10.0))
+        self.spatial=GATConv(d,SPATIAL_DIM//2,heads=2,concat=True,dropout=DROPOUT,add_self_loops=True,bias=False,edge_dim=1,fill_value=1.0)
+        self.context=nn.Sequential(nn.Linear(cdim,CONTEXT_DIM),nn.ELU())
+        self.dec=nn.Sequential(nn.Linear(OWN_DIM+SPATIAL_DIM+CONTEXT_DIM,DECODER_HIDDEN),nn.ELU(),nn.Dropout(DROPOUT),nn.Linear(DECODER_HIDDEN,DECODER_HIDDEN),nn.ELU(),nn.Linear(DECODER_HIDDEN,out))
+    def forward(self,x,ei,dist,C):
+        own=F.elu(self.own(x)); spatial=F.elu(self.spatial(x,ei,edge_attr=torch.exp(-dist/DISTANCE_DECAY))); context=self.context(C)
+        return self.dec(F.dropout(torch.cat([own,spatial,context],1),DROPOUT,training=self.training))
+
+
+def forward(model,name): return model(X) if name=='mlp' else model(X,ei,dist,C)
+
+
+def train(model,name,seed):
+    seed_all(seed); model=model.to(DEVICE); opt=torch.optim.Adam(model.parameters(),lr=LEARNING_RATE,weight_decay=WEIGHT_DECAY); sch=torch.optim.lr_scheduler.ReduceLROnPlateau(opt,mode='min',patience=LR_PATIENCE,factor=.5,min_lr=1e-7)
+    best=np.inf; state=None; stale=0; rows=[]
+    for epoch in range(1,MAX_EPOCHS+1):
+        model.train(); opt.zero_grad(set_to_none=True); p=forward(model,name); loss=negative_binomial_nll(p[tr],Y[tr],logN[tr],mu0,model.raw_theta); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+        model.eval()
+        with torch.no_grad(): vp=forward(model,name); vl=float(negative_binomial_nll(vp[va],Y[va],logN[va],mu0,model.raw_theta))
+        sch.step(vl); rows.append(dict(epoch=epoch,train_negative_binomial_nll=float(loss),val_negative_binomial_nll=vl,lr=opt.param_groups[0]['lr']))
+        if vl<best-1e-7: best=vl; state=copy.deepcopy(model.state_dict()); stale=0
+        else: stale+=1
+        if epoch==1 or epoch%25==0: print(name,seed,epoch,'train',float(loss),'val',vl,'best',best)
+        if stale>=EARLY_STOPPING_PATIENCE: break
+    if state is None: raise RuntimeError('No checkpoint')
+    model.load_state_dict(state); pd.DataFrame(rows).to_csv(OUTDIR/f'{name}_seed{seed}_history.csv',index=False); torch.save(state,OUTDIR/f'{name}_seed{seed}_best.pt')
+    return model
+
+
+rows=[]; preds={}
+for seed in SEEDS:
+    model_name='concat_residual_gat' if MODEL_KIND=='concat' else 'cell_type_context_gat'
+    gat=ConcatResidualGAT(X.shape[1],Y.shape[1]) if MODEL_KIND=='concat' else CellTypeContextGAT(X.shape[1],C.shape[1],Y.shape[1])
+    for name,model in [('mlp',MatchedMLP(X.shape[1],Y.shape[1])),(model_name,gat)]:
+        print('\nTRAIN',name,'SEED',seed); model=train(model,name,seed); model.eval()
+        with torch.no_grad(): residual=forward(model,name); test_loss=float(negative_binomial_nll(residual[te],Y[te],logN[te],mu0,model.raw_theta)); mu=make_mu(residual,logN,mu0)[te].cpu().numpy()
+        y=Y[te].cpu().numpy(); rows.append(dict(model=name,seed=seed,test_eb=str(test_eb),val_eb=str(val_eb),test_negative_binomial_nll=test_loss,n_parameters=sum(p.numel() for p in model.parameters()),**metrics(y,mu))); preds[(name,seed)]=mu.astype(np.float32)
+        save_hexbin(y,mu,f'{name} seed {seed}',OUTDIR/f'{name}_seed{seed}_true_vs_predicted.png')
+
+res=pd.DataFrame(rows); res.to_csv(OUTDIR/'per_seed_test_metrics.csv',index=False)
+summary=res.groupby('model',as_index=False).agg(mean_test_negative_binomial_nll=('test_negative_binomial_nll','mean'),sd_test_negative_binomial_nll=('test_negative_binomial_nll','std'),mean_log1p_pearson=('log1p_pearson','mean'),mean_log1p_rmse=('log1p_rmse','mean'),mean_log1p_mae=('log1p_mae','mean')); summary.to_csv(OUTDIR/'model_summary.csv',index=False)
+y=Y[te].cpu().numpy(); np.save(OUTDIR/'heldout_true_counts.npy',y.astype(np.float32)); model_name='concat_residual_gat' if MODEL_KIND=='concat' else 'cell_type_context_gat'
+for name in ['mlp',model_name]:
+    mean_mu=np.mean([preds[(name,s)] for s in SEEDS],axis=0); np.save(OUTDIR/f'{name}_mean_predicted_mu.npy',mean_mu.astype(np.float32)); save_hexbin(y,mean_mu,f'{name} mean across seeds',OUTDIR/f'{name}_mean_true_vs_predicted.png')
+ordered=summary.set_index('model').loc[['mlp',model_name]]; fig,ax=plt.subplots(figsize=(5.6,4.5)); ax.bar(['Matched MLP',model_name],ordered.mean_test_negative_binomial_nll,yerr=ordered.sd_test_negative_binomial_nll.fillna(0),capsize=4); ax.set_ylabel('Held-out negative-binomial negative log-likelihood'); ax.set_title('Held-out loss across seeds'); ax.tick_params(axis='x',rotation=12); fig.tight_layout(); fig.savefig(OUTDIR/'test_loss_comparison.png',dpi=300,bbox_inches='tight'); plt.close(fig)
+pd.DataFrame({'guide':guide_names,'cells_positive':guides.sum(0).astype(int)}).to_csv(OUTDIR/'individual_guides.csv',index=False)
+pd.DataFrame({'gene':gene_names,'hvg_index':hvg_idx}).to_csv(OUTDIR/'modeled_genes.csv',index=False)
+pd.DataFrame(Cnp,index=adata.obs_names,columns=[f'neighbor_fraction::{x}' for x in ct_names]).to_csv(OUTDIR/'neighborhood_cell_type_proportions.csv')
+print(res.to_string(index=False)); print(summary.to_string(index=False)); print('Outputs',OUTDIR)
+
+
+# INDIVIDUAL CELL × GENE SCATTER PLOTS
+# Each dot = one held-out cell × one modeled gene
+# x = true raw count
+# y = predicted Poisson mean (mu)
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+def save_cell_gene_scatter(
+    true_counts,
+    predicted_mu,
+    model_label,
+    output_path,
+    use_log1p=False,
+):
+    true_counts = np.asarray(true_counts, dtype=np.float64).ravel()
+    predicted_mu = np.asarray(predicted_mu, dtype=np.float64).ravel()
+
+    valid = (
+        np.isfinite(true_counts)
+        & np.isfinite(predicted_mu)
+        & (true_counts >= 0)
+        & (predicted_mu >= 0)
+    )
+
+    true_counts = true_counts[valid]
+    predicted_mu = predicted_mu[valid]
+
+    if use_log1p:
+        x = np.log1p(true_counts)
+        y = np.log1p(predicted_mu)
+        scale_name = "log1p"
+        x_label = "log1p(true held-out count)"
+        y_label = "log1p(predicted mean mu)"
+    else:
+        x = true_counts
+        y = predicted_mu
+        scale_name = "raw"
+        x_label = "True held-out raw count"
+        y_label = "Predicted raw mean count (mu)"
+
+    pearson = pearsonr(x, y).statistic
+    spearman = spearmanr(x, y).statistic
+    rmse = np.sqrt(mean_squared_error(x, y))
+    mae = mean_absolute_error(x, y)
+
+    # Keep extreme outliers from making the central distribution unreadable
+    axis_max = max(
+        np.percentile(x, 99.9),
+        np.percentile(y, 99.9),
+        1.0,
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    ax.scatter(
+        x,
+        y,
+        s=3,
+        alpha=0.08,
+        linewidths=0,
+        rasterized=True,
+    )
+
+    ax.plot(
+        [0, axis_max],
+        [0, axis_max],
+        linestyle="--",
+        linewidth=2,
+        color="black",
+        label="Perfect prediction",
+    )
+
+    ax.set_xlim(0, axis_max)
+    ax.set_ylim(0, axis_max)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+
+    ax.set_title(
+        f"{model_label}: individual cell × gene observations\n"
+        f"Pearson r={pearson:.3f}, "
+        f"Spearman={spearman:.3f}, "
+        f"RMSE={rmse:.3f}, "
+        f"MAE={mae:.3f}"
+    )
+
+    ax.legend(frameon=False)
+    fig.tight_layout()
+
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.show()
+    plt.close(fig)
+
+    print(
+        f"{model_label} {scale_name}: "
+        f"Pearson={pearson:.6f}, "
+        f"Spearman={spearman:.6f}, "
+        f"RMSE={rmse:.6f}, "
+        f"MAE={mae:.6f}, "
+        f"n_cell_gene={len(x)}"
+    )
+
+
+true_counts = np.load(
+    OUTDIR / "heldout_true_counts.npy"
+)
+
+mlp_mu = np.load(
+    OUTDIR / "mlp_mean_predicted_mu.npy"
+)
+
+if (OUTDIR / "concat_residual_gat_mean_predicted_mu.npy").exists():
+    gat_name = "concat_residual_gat"
+    gat_label = "Concatenation residual GAT"
+
+elif (OUTDIR / "cell_type_context_gat_mean_predicted_mu.npy").exists():
+    gat_name = "cell_type_context_gat"
+    gat_label = "Cell-type-context GAT"
+
+else:
+    raise FileNotFoundError(
+        "Could not find a saved GAT mean-prediction file in OUTDIR."
+    )
+
+gat_mu = np.load(
+    OUTDIR / f"{gat_name}_mean_predicted_mu.npy"
+)
+
+
+# Raw-count plots
+save_cell_gene_scatter(
+    true_counts=true_counts,
+    predicted_mu=mlp_mu,
+    model_label="Matched MLP",
+    output_path=OUTDIR / "mlp_individual_cell_gene_raw_scatter.png",
+    use_log1p=False,
+)
+
+save_cell_gene_scatter(
+    true_counts=true_counts,
+    predicted_mu=gat_mu,
+    model_label=gat_label,
+    output_path=OUTDIR / f"{gat_name}_individual_cell_gene_raw_scatter.png",
+    use_log1p=False,
+)
+
+
+# log1p plots
+save_cell_gene_scatter(
+    true_counts=true_counts,
+    predicted_mu=mlp_mu,
+    model_label="Matched MLP",
+    output_path=OUTDIR / "mlp_individual_cell_gene_log1p_scatter.png",
+    use_log1p=True,
+)
+
+save_cell_gene_scatter(
+    true_counts=true_counts,
+    predicted_mu=gat_mu,
+    model_label=gat_label,
+    output_path=OUTDIR / f"{gat_name}_individual_cell_gene_log1p_scatter.png",
+    use_log1p=True,
+)
