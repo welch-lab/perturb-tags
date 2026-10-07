@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import gc
+import hashlib
+import os
+import re
+import shutil
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import mudata as md
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+from statsmodels.stats.multitest import multipletests
+
+warnings.filterwarnings("ignore")
+
+
+@dataclass(frozen=True)
+class AnalysisConfig:
+    mode_name: str
+    env_prefix: str
+    output_name: str
+    compensatory_tests: Sequence[Tuple[str, str, str, str]]
+
+
+DATA_DIR = Path("/scratch/welchjd_root/welchjd1/javidgmh/15515_Multiome/catatac_work/motif_analysis")
+H5MU_PATH = DATA_DIR / "all_lanes_merged_CATATAC_QC_RNA_processed_EB_manual_clustering_cell_types.h5mu"
+LR_PATH = DATA_DIR / "all_EB_contact_diffusion_LR_scores_LONG_sparse_WITH_lr_name.csv"
+
+MAX_DISTANCE = 300.0
+BIN_EDGES = np.arange(0.0, MAX_DISTANCE + 50.0, 50.0)
+BIN_MIDS = (BIN_EDGES[:-1] + BIN_EDGES[1:]) / 2.0
+SEED = 1
+MIN_KD_CELLS_PER_EB = 2
+MIN_RECEIVERS = 10
+FDR_THRESHOLD = 0.05
+GUIDE_COL = "guides_passing_str"
+EB_COL = "EB_manual_clustering"
+TEST_BLOCK_SIZE = 1024
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.linewidth": 0.9,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
+})
+
+
+KD_COMPONENT_IDENTIFIERS = {
+    "ACVR2B": {"ACVR2B", "Q13705", "ACVR_1A2B RECEPTOR", "ACVR_1B2B RECEPTOR", "ACVR_1C2B RECEPTOR"},
+    "ALB": {"ALB", "P02768"},
+    "B2M": {"B2M", "P61769", "HLAC"},
+    "BMP5": {"BMP5", "P22003"},
+    "BMP7": {"BMP7", "P18075"},
+    "DLL3": {"DLL3", "Q9NYJ7"},
+    "EFNA3": {"EFNA3", "P52797"},
+    "EPHA7": {"EPHA7", "Q15375"},
+    "FCGRT": {"FCGRT", "FCRN", "P55899", "FCRN COMPLEX"},
+    "FLT1": {"FLT1", "P17948", "FLT1 COMPLEX"},
+    "FZD3": {"FZD3", "Q9NPG1"},
+    "JAG1": {"JAG1", "P78504"},
+    "LGR4": {"LGR4", "Q9BXB1"},
+    "NECTIN2": {"NECTIN2", "Q92692"},
+    "NECTIN3": {"NECTIN3", "Q9NQS3"},
+    "NOTCH1": {"NOTCH1", "P46531"},
+    "NRP1": {"NRP1", "O14786"},
+    "PDGFC": {"PDGFC", "Q9NRA1"},
+    "PDGFRA": {"PDGFRA", "P16234", "PDGFR COMPLEX"},
+    "PLXNA2": {"PLXNA2", "O75051", "PLEXINA2", "PLEXINA2 COMPLEX1"},
+    "RSPO3": {"RSPO3", "Q9BXY4"},
+    "SEMA6D": {"SEMA6D", "Q8NFY4"},
+    "VEGFB": {"VEGFB", "P49765"},
+    "WNT1": {"WNT1", "P04628"},
+    "WNT5A": {"WNT5A", "P41221"},
+}
+
+
+def safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+
+
+def stable_seed(*parts: object) -> int:
+    joined = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(joined).hexdigest()[:16]
+    return int(digest, 16) % np.iinfo(np.int32).max
+
+
+def current_mode(config: AnalysisConfig) -> str:
+    mode = os.environ.get(f"{config.env_prefix}_MODE", "full").strip().lower()
+    if mode not in {"full", "compute", "aggregate"}:
+        raise ValueError(f"{config.env_prefix}_MODE must be one of: full, compute, aggregate")
+    return mode
+
+
+def resolve_targets(config: AnalysisConfig, all_targets: Sequence[str]) -> List[str]:
+    explicit_target = os.environ.get(f"{config.env_prefix}_TARGET", "").strip()
+    if explicit_target:
+        if explicit_target not in all_targets:
+            raise ValueError(f"Unknown {config.env_prefix}_TARGET: {explicit_target}")
+        return [explicit_target]
+
+    explicit_targets = os.environ.get(f"{config.env_prefix}_TARGETS", "").strip()
+    if explicit_targets:
+        parsed = [token.strip() for token in explicit_targets.split(",") if token.strip()]
+        unknown = [token for token in parsed if token not in all_targets]
+        if unknown:
+            raise ValueError(f"Unknown {config.env_prefix}_TARGETS values: {unknown}")
+        return parsed
+
+    raw_index = os.environ.get(f"{config.env_prefix}_TARGET_INDEX", "").strip()
+    if not raw_index:
+        raw_index = os.environ.get("SLURM_ARRAY_TASK_ID", "").strip()
+    if raw_index:
+        idx = int(raw_index)
+        if 1 <= idx <= len(all_targets):
+            return [all_targets[idx - 1]]
+        if 0 <= idx < len(all_targets):
+            return [all_targets[idx]]
+        raise ValueError(f"{config.env_prefix} target index out of range: {idx}")
+
+    return list(all_targets)
+
+
+def n_permutations(config: AnalysisConfig) -> int:
+    return int(os.environ.get(f"{config.env_prefix}_N_PERM", "100000"))
+
+
+def null_chunk_size(config: AnalysisConfig) -> int:
+    return int(os.environ.get(f"{config.env_prefix}_NULL_CHUNK_SIZE", "8192"))
+
+
+def save_full_nulls(config: AnalysisConfig) -> bool:
+    return os.environ.get(f"{config.env_prefix}_SAVE_FULL_NULLS", "1") != "0"
+
+
+def guide_has_gene(s: str, gene: str) -> bool:
+    if not s or str(s).lower() in {"nan", "none"}:
+        return False
+    for token in re.split(r"[;,|\s]+", str(s)):
+        token = token.strip()
+        if not token:
+            continue
+        target = re.sub(r"-\d+$", "", token)
+        if target.upper() == gene.upper():
+            return True
+    return False
+
+
+def canonicalize_eb(x: str) -> str:
+    s = str(x)
+    match = re.search(r"(?:EB[_-]?)?(\d+)$", s, flags=re.I)
+    return f"EB_{int(match.group(1))}" if match else s
+
+
+def build_alias_map(obs: pd.DataFrame) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for idx, row in obs.iterrows():
+        canonical = str(idx)
+        candidates = {canonical, canonical.removesuffix("-1")}
+        lane = str(row.get("lane", ""))
+        for column in ["global_cell_id", "gex_barcode", "raw_cell_barcode", "barcode_raw"]:
+            if column not in obs.columns:
+                continue
+            value = str(row[column])
+            if not value or value.lower() == "nan":
+                continue
+            candidates.add(value)
+            candidates.add(value.removesuffix("-1"))
+            if lane:
+                candidates.add(f"{lane}_{value}")
+                candidates.add(f"{lane}_{value.removesuffix('-1')}")
+        for alias in candidates:
+            if alias:
+                aliases.setdefault(alias, canonical)
+    return aliases
+
+
+def identify_lr_annotation_columns(lr_dataframe: pd.DataFrame) -> List[str]:
+    possible_exact_names = {
+        "ligand", "ligand_gene", "ligand_genes", "ligand_symbol", "ligand_symbols",
+        "receptor", "receptor_gene", "receptor_genes", "receptor_symbol", "receptor_symbols",
+        "source", "source_gene", "source_genes", "target", "target_gene", "target_genes",
+        "sender", "receiver", "partner_a", "partner_b", "gene_a", "gene_b",
+    }
+    annotation_columns = ["lr_name"]
+    for column in lr_dataframe.columns:
+        column_lower = column.lower()
+        if column_lower in possible_exact_names:
+            annotation_columns.append(column)
+        elif "ligand" in column_lower or "receptor" in column_lower:
+            annotation_columns.append(column)
+    return list(dict.fromkeys(annotation_columns))
+
+
+def resolve_lr_columns(df: pd.DataFrame) -> pd.DataFrame:
+    lower = {column.lower(): column for column in df.columns}
+    required = {
+        "cell_id": ["cell_id", "cell", "barcode"],
+        "interaction_id": ["interaction_id", "interaction", "lr_id"],
+        "lr_name": ["lr_name", "interaction_name", "name"],
+        "lr_score": ["lr_score", "score", "value"],
+    }
+    rename = {}
+    for out, choices in required.items():
+        found = next((lower[c] for c in choices if c in lower), None)
+        if found is None:
+            raise ValueError(f"LR CSV is missing {out}. Columns: {list(df.columns)}")
+        rename[found] = out
+    optional = {
+        "lr_type": ["lr_type", "type"],
+        "ligand_name": ["ligand_name", "ligand"],
+        "receptor_name": ["receptor_name", "receptor"],
+        "EB": ["eb", "eb_cluster", "eb_manual_clustering"],
+    }
+    for out, choices in optional.items():
+        found = next((lower[c] for c in choices if c in lower), None)
+        if found is not None:
+            rename[found] = out
+    return df.rename(columns=rename)
+
+
+def normalize_component_text(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value).upper())
+
+
+def component_has_kd(component_value: str, kd_gene: str) -> bool:
+    component_raw = str(component_value).upper()
+    component_compact = normalize_component_text(component_raw)
+    identifiers = KD_COMPONENT_IDENTIFIERS.get(kd_gene.upper(), {kd_gene.upper()})
+    for identifier in identifiers:
+        identifier_raw = str(identifier).upper()
+        exact = rf"(?<![A-Z0-9]){re.escape(identifier_raw)}(?![A-Z0-9])"
+        if re.search(exact, component_raw):
+            return True
+        if normalize_component_text(identifier_raw) == component_compact:
+            return True
+    return False
+
+
+def extract_all_kd_genes(obs: pd.DataFrame) -> List[str]:
+    excluded = {"", "UNASSIGNED", "NON-TARGETING", "NO_CRISPR_DATA", "NAN", "NONE"}
+    genes = {
+        str(x).strip().upper()
+        for x in obs["target_call"].astype(str)
+        if str(x).strip().upper() not in excluded
+    }
+    for s in obs["guide_string"]:
+        for token in re.split(r"[;,|\s]+", str(s)):
+            token = token.strip()
+            if not token or token.lower().startswith("negative control"):
+                continue
+            target = re.sub(r"-\d+$", "", token).strip().upper()
+            if target and target not in excluded:
+                genes.add(target)
+    return sorted(genes)
+
+
+def select_direct_tests(lr_meta: pd.DataFrame, kd_genes: Sequence[str]) -> pd.DataFrame:
+    required = {"ligand_name", "receptor_name"}
+    missing = required - set(lr_meta.columns)
+    if missing:
+        raise ValueError(f"LR CSV is missing required component columns: {sorted(missing)}")
+    rows = []
+    for kd in kd_genes:
+        mask = (
+            lr_meta["ligand_name"].map(lambda value: component_has_kd(value, kd))
+            | lr_meta["receptor_name"].map(lambda value: component_has_kd(value, kd))
+        )
+        sub = lr_meta.loc[mask].copy()
+        if not sub.empty:
+            sub["kd_gene"] = kd
+            rows.append(sub)
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    keep = ["kd_gene", "lr_type", "lr_name", "interaction_id", "ligand_name", "receptor_name"]
+    keep = [column for column in keep if column in out.columns]
+    out = out[keep].drop_duplicates().reset_index(drop=True) if not out.empty else out
+    if out.empty:
+        raise ValueError("No direct KD-LR tests matched ligand_name or receptor_name.")
+    return out
+
+
+def select_compensatory_tests(
+    lr_meta: pd.DataFrame,
+    compensatory_tests: Sequence[Tuple[str, str, str, str]],
+) -> pd.DataFrame:
+    curated = pd.DataFrame(
+        compensatory_tests,
+        columns=["kd_gene", "lr_type", "lr_name", "interaction_id"],
+    )
+    by_id = curated.merge(lr_meta, on="interaction_id", how="inner", suffixes=("_curated", ""))
+    if by_id.empty:
+        by_id = curated.merge(lr_meta, on="lr_name", how="inner", suffixes=("_curated", ""))
+    if "lr_type_curated" in by_id.columns:
+        by_id["lr_type"] = by_id["lr_type"].fillna(by_id["lr_type_curated"])
+    out = by_id
+    keep = [c for c in ["kd_gene", "lr_type", "lr_name", "interaction_id", "ligand_name", "receptor_name"] if c in out.columns]
+    out = out[keep].drop_duplicates().reset_index(drop=True)
+    if out.empty:
+        raise ValueError("No compensatory KD-LR tests matched the LR CSV.")
+    return out
+
+
+def pairwise_distance_matrix(coords: np.ndarray) -> np.ndarray:
+    coords32 = np.asarray(coords, dtype=np.float32)
+    delta = coords32[:, None, :] - coords32[None, :, :]
+    squared = np.sum(delta * delta, axis=2, dtype=np.float32)
+    distances = np.sqrt(squared).astype(np.float32, copy=False)
+    np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def nearest_reference_distances_from_matrix(distance_matrix: np.ndarray, reference_indices: np.ndarray) -> np.ndarray:
+    if len(reference_indices) < 1:
+        raise ValueError("No reference cells")
+    if len(reference_indices) == 1:
+        return distance_matrix[:, reference_indices[0]].astype(np.float32, copy=False)
+    return distance_matrix[:, reference_indices].min(axis=1).astype(np.float32, copy=False)
+
+
+def rank_vector(values: np.ndarray) -> np.ndarray:
+    try:
+        return np.asarray(rankdata(values, method="average"), dtype=np.float64)
+    except TypeError:
+        return np.asarray(rankdata(values), dtype=np.float64)
+
+
+def rank_columns(values: np.ndarray) -> np.ndarray:
+    try:
+        return np.asarray(rankdata(values, axis=0, method="average"), dtype=np.float64)
+    except TypeError:
+        return pd.DataFrame(values).rank(axis=0, method="average").to_numpy(dtype=np.float64, copy=False)
+
+
+def centered_rank_vector(values: np.ndarray) -> Tuple[np.ndarray, float]:
+    ranks = rank_vector(values)
+    ranks -= ranks.mean()
+    scale = float(np.sqrt(np.dot(ranks, ranks)))
+    return ranks, scale
+
+
+def spearman_rho_block_no_nan(ranked_x: np.ndarray, scale_x: float, values: np.ndarray) -> np.ndarray:
+    if values.shape[0] < MIN_RECEIVERS or not np.isfinite(scale_x) or scale_x == 0.0:
+        return np.full(values.shape[1], np.nan, dtype=float)
+    ranked_y = rank_columns(values)
+    ranked_y -= ranked_y.mean(axis=0, keepdims=True)
+    scale_y = np.sqrt((ranked_y * ranked_y).sum(axis=0))
+    numerator = ranked_x @ ranked_y
+    return np.divide(
+        numerator,
+        scale_x * scale_y,
+        out=np.full(values.shape[1], np.nan, dtype=float),
+        where=scale_y > 0,
+    )
+
+
+def bin_profile(dist: np.ndarray, score: np.ndarray) -> pd.DataFrame:
+    rows = []
+    for i, (lo, hi) in enumerate(zip(BIN_EDGES[:-1], BIN_EDGES[1:])):
+        mask = (dist >= lo) & ((dist < hi) if i < len(BIN_MIDS) - 1 else (dist <= hi))
+        vals = score[mask]
+        rows.append({
+            "bin_index": i + 1,
+            "bin_start": lo,
+            "bin_end": hi,
+            "bin_mid": BIN_MIDS[i],
+            "n_cells": int(mask.sum()),
+            "mean_lr_score": float(np.nanmean(vals)) if mask.sum() else np.nan,
+            "sem_lr_score": (
+                float(np.nanstd(vals, ddof=1) / np.sqrt(np.isfinite(vals).sum()))
+                if np.isfinite(vals).sum() > 1 else np.nan
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def initialize_permutation_state(
+    observed_results: pd.DataFrame,
+    dense_scores: np.ndarray,
+    null_dir_root: Path,
+    unit_label: str,
+) -> dict:
+    null_chunk_dir = null_dir_root / safe_name(f"{unit_label}_null_rho_chunks")
+    if null_chunk_dir.exists():
+        shutil.rmtree(null_chunk_dir)
+    null_chunk_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "observed_rhos": observed_results["rho_distance"].to_numpy(dtype=float),
+        "dense_scores": dense_scores,
+        "positive_tail_counts": np.zeros(len(observed_results), dtype=np.int64),
+        "negative_tail_counts": np.zeros(len(observed_results), dtype=np.int64),
+        "valid_perm_counts": np.zeros(len(observed_results), dtype=np.int64),
+        "null_chunk_dir": null_chunk_dir,
+        "null_manifest_rows": [],
+        "manifest_path": null_chunk_dir / "manifest.csv",
+    }
+
+
+def update_state_for_permutation(
+    state: dict,
+    score_index: np.ndarray,
+    ranked_x: np.ndarray,
+    scale_x: float,
+    chunk_column: int,
+    chunk_null_rhos: Optional[np.ndarray],
+) -> None:
+    observed_rhos = state["observed_rhos"]
+    dense_scores = state["dense_scores"]
+    for start in range(0, dense_scores.shape[1], TEST_BLOCK_SIZE):
+        stop = min(start + TEST_BLOCK_SIZE, dense_scores.shape[1])
+        block = dense_scores[score_index, start:stop]
+        rho_block = spearman_rho_block_no_nan(ranked_x, scale_x, block)
+        if chunk_null_rhos is not None:
+            chunk_null_rhos[start:stop, chunk_column] = rho_block.astype(np.float32, copy=False)
+        finite = np.isfinite(rho_block)
+        state["valid_perm_counts"][start:stop] += finite.astype(np.int64)
+        state["positive_tail_counts"][start:stop] += (
+            finite & (rho_block >= observed_rhos[start:stop])
+        ).astype(np.int64)
+        state["negative_tail_counts"][start:stop] += (
+            finite & (rho_block <= observed_rhos[start:stop])
+        ).astype(np.int64)
+
+
+def flush_null_chunk(
+    state: dict,
+    unit_label: str,
+    chunk_start: int,
+    chunk_stop: int,
+    chunk_null_rhos: Optional[np.ndarray],
+) -> None:
+    if chunk_null_rhos is None:
+        return
+    chunk_path = state["null_chunk_dir"] / safe_name(
+        f"{unit_label}_null_rhos_perm_{chunk_start:06d}_{chunk_stop - 1:06d}.npz"
+    )
+    np.savez_compressed(chunk_path, null_rhos=chunk_null_rhos)
+    state["null_manifest_rows"].append({
+        "unit_label": unit_label,
+        "perm_start_inclusive": chunk_start,
+        "perm_stop_exclusive": chunk_stop,
+        "n_tests": int(chunk_null_rhos.shape[0]),
+        "n_permutations": int(chunk_null_rhos.shape[1]),
+        "dtype": "float32",
+        "path": str(chunk_path),
+    })
+
+
+def finalize_permutation_state(state: dict) -> dict:
+    valid_counts = state["valid_perm_counts"]
+    positive_counts = state["positive_tail_counts"]
+    negative_counts = state["negative_tail_counts"]
+    p_positive = np.full(len(valid_counts), np.nan, dtype=float)
+    p_negative = np.full(len(valid_counts), np.nan, dtype=float)
+    valid = valid_counts > 0
+    p_positive[valid] = (1.0 + positive_counts[valid]) / (1.0 + valid_counts[valid])
+    p_negative[valid] = (1.0 + negative_counts[valid]) / (1.0 + valid_counts[valid])
+    pd.DataFrame(state["null_manifest_rows"]).to_csv(state["manifest_path"], index=False)
+    return {
+        "p_positive": p_positive,
+        "p_negative": p_negative,
+        "positive_tail_counts": positive_counts,
+        "negative_tail_counts": negative_counts,
+        "valid_counts": valid_counts,
+        "manifest_path": str(state["manifest_path"]),
+        "chunk_dir": str(state["null_chunk_dir"]),
+    }
+
+
+def plot_dataset_level_group(sub: pd.DataFrame, title: str, path_base: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6.5, 4.8))
+    sub = sub.sort_values("bin_mid")
+    ax.plot(sub["bin_mid"], sub["mean_lr_score"], marker="o", linewidth=1.4, markersize=3.6)
+    ax.fill_between(
+        sub["bin_mid"].to_numpy(dtype=float),
+        (sub["mean_lr_score"] - sub["sem_lr_score"]).to_numpy(dtype=float),
+        (sub["mean_lr_score"] + sub["sem_lr_score"]).to_numpy(dtype=float),
+        alpha=0.18,
+    )
+    ax.set_title(title, fontsize=10, weight="bold")
+    ax.set_xlabel("Distance to nearest KD cell within EB (µm)")
+    ax.set_ylabel("Mean CytoSignal LR score")
+    ax.set_xlim(0, MAX_DISTANCE)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path_base.with_suffix(".png"), dpi=600, bbox_inches="tight")
+    fig.savefig(path_base.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_analysis(config: AnalysisConfig) -> None:
+    mode = current_mode(config)
+    output_dir = DATA_DIR / config.output_name
+    result_dir = output_dir / "dataset_level_results"
+    profile_dir = output_dir / "dataset_level_bin_profiles"
+    plot_dir = output_dir / "significant_dataset_level_plots"
+    null_dir = output_dir / "saved_null_rho_distributions"
+    for directory in (output_dir, result_dir, profile_dir, plot_dir, null_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    raw_result_pattern = f"*_dataset_level_{config.mode_name}_KD_LR_results_RAW.csv"
+    raw_profile_pattern = f"*_dataset_level_{config.mode_name}_KD_LR_bin_profiles_RAW.csv"
+
+    def collect_raw_result_files() -> List[Path]:
+        return sorted(
+            path for path in result_dir.glob(raw_result_pattern)
+            if not path.name.startswith("ALL_")
+        )
+
+    def collect_raw_profile_files() -> List[Path]:
+        return sorted(
+            path for path in profile_dir.glob(raw_profile_pattern)
+            if not path.name.startswith("ALL_")
+        )
+
+    def run_aggregate_only() -> None:
+        raw_result_files = collect_raw_result_files()
+        raw_profile_files = collect_raw_profile_files()
+        if not raw_result_files:
+            raise FileNotFoundError("No per-KD raw dataset-level result files found for aggregation.")
+
+        results = pd.concat([pd.read_csv(path) for path in raw_result_files], ignore_index=True)
+        profiles = (
+            pd.concat([pd.read_csv(path) for path in raw_profile_files], ignore_index=True)
+            if raw_profile_files else pd.DataFrame()
+        )
+        if results.empty:
+            print("\nNo dataset-level KD x LR tests completed.")
+            return
+
+        results["fdr_positive_one_sided"] = np.nan
+        results["fdr_negative_one_sided"] = np.nan
+        for kd_gene, idx in results.groupby("kd_gene").groups.items():
+            idx = list(idx)
+            p_pos = results.loc[idx, "p_positive_one_sided"]
+            p_neg = results.loc[idx, "p_negative_one_sided"]
+            valid_pos = p_pos.notna()
+            valid_neg = p_neg.notna()
+            if valid_pos.any():
+                results.loc[p_pos[valid_pos].index, "fdr_positive_one_sided"] = multipletests(
+                    p_pos[valid_pos], method="fdr_bh"
+                )[1]
+            if valid_neg.any():
+                results.loc[p_neg[valid_neg].index, "fdr_negative_one_sided"] = multipletests(
+                    p_neg[valid_neg], method="fdr_bh"
+                )[1]
+
+        results["passes_fdr_positive"] = results["fdr_positive_one_sided"] < FDR_THRESHOLD
+        results["passes_fdr_negative"] = results["fdr_negative_one_sided"] < FDR_THRESHOLD
+        results["significant_any_direction"] = results["passes_fdr_positive"] | results["passes_fdr_negative"]
+        results["significant_direction"] = np.select(
+            [
+                results["passes_fdr_positive"] & results["passes_fdr_negative"],
+                results["passes_fdr_positive"],
+                results["passes_fdr_negative"],
+            ],
+            ["both", "positive", "negative"],
+            default="none",
+        )
+
+        result_all_path = result_dir / "ALL_KD_dataset_level_KD_LR_results.csv"
+        result_sig_path = result_dir / "ALL_FDR_passing_dataset_level_KD_LR_results.csv"
+        results.to_csv(result_all_path, index=False)
+        results.loc[results["significant_any_direction"]].to_csv(result_sig_path, index=False)
+
+        if not profiles.empty:
+            profiles.to_csv(profile_dir / "ALL_dataset_level_KD_LR_bin_profiles.csv", index=False)
+
+        key_cols = ["kd_gene", "lr_type", "lr_name", "interaction_id"]
+        sig_keys = results.loc[results["significant_any_direction"], key_cols].drop_duplicates()
+        sig_profiles = (
+            profiles.merge(sig_keys, on=key_cols, how="inner")
+            if not profiles.empty else pd.DataFrame()
+        )
+        if not sig_profiles.empty:
+            sig_profiles.to_csv(
+                profile_dir / "FDR_passing_dataset_level_KD_LR_bin_profiles.csv",
+                index=False,
+            )
+
+            for key, sub in sig_profiles.groupby(key_cols, sort=True):
+                kd, lr_type, lr_name, interaction_id = key
+                stat = results[
+                    (results["kd_gene"] == kd)
+                    & (results["lr_type"] == lr_type)
+                    & (results["lr_name"] == lr_name)
+                    & (results["interaction_id"] == interaction_id)
+                ].iloc[0]
+                title = (
+                    f"{kd} KD -> {lr_name}\n"
+                    f"rho={stat['rho_distance']:.3f}; "
+                    f"FDR+={stat['fdr_positive_one_sided']:.3g}; "
+                    f"FDR-={stat['fdr_negative_one_sided']:.3g}; "
+                    f"direction={stat['significant_direction']}"
+                )
+                base = plot_dir / safe_name(f"{kd}_KD__{lr_type}__{lr_name}__{interaction_id}")
+                plot_dataset_level_group(sub, title, base)
+
+            keys = list(sig_profiles.groupby(key_cols, sort=True).groups.keys())
+            overview_pdf = plot_dir / f"ALL_FDR_passing_dataset_level_{config.mode_name}_KD_LR_plots.pdf"
+            with PdfPages(overview_pdf) as pdf:
+                for page_start in range(0, len(keys), 8):
+                    page_keys = keys[page_start:page_start + 8]
+                    fig, axes = plt.subplots(2, 4, figsize=(16, 8), squeeze=False)
+                    for ax, key in zip(axes.ravel(), page_keys):
+                        sub = sig_profiles
+                        for col, value in zip(key_cols, key):
+                            sub = sub[sub[col] == value]
+                        sub = sub.sort_values("bin_mid")
+                        ax.plot(sub["bin_mid"], sub["mean_lr_score"], marker="o", linewidth=0.9, markersize=2.3)
+                        kd, lr_type, lr_name, interaction_id = key
+                        stat = results[
+                            (results["kd_gene"] == kd)
+                            & (results["lr_type"] == lr_type)
+                            & (results["lr_name"] == lr_name)
+                            & (results["interaction_id"] == interaction_id)
+                        ].iloc[0]
+                        ax.set_title(
+                            f"{kd} KD -> {lr_name}\n"
+                            f"rho={stat['rho_distance']:.2f}; "
+                            f"dir={stat['significant_direction']}",
+                            fontsize=8,
+                            weight="bold",
+                        )
+                        ax.set_xlim(0, MAX_DISTANCE)
+                        ax.spines["top"].set_visible(False)
+                        ax.spines["right"].set_visible(False)
+                        ax.tick_params(labelsize=7)
+                    for ax in axes.ravel()[len(page_keys):]:
+                        ax.axis("off")
+                    fig.supxlabel("Distance to nearest KD cell within EB (µm)")
+                    fig.supylabel("Mean CytoSignal LR score")
+                    fig.suptitle(
+                        f"FDR-passing dataset-level {config.mode_name} KD-LR effects",
+                        weight="bold",
+                    )
+                    fig.tight_layout(rect=[0.03, 0.03, 1, 0.95])
+                    pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+
+        print("\nDONE")
+        print("Output:", output_dir)
+        print("Dataset-level KD-LR tests:", len(results))
+        print("FDR-passing dataset-level tests:", int(results["significant_any_direction"].sum()))
+
+    print(f"Run mode: {mode}")
+    print(f"Save full nulls: {save_full_nulls(config)}")
+    print(f"Null chunk size: {null_chunk_size(config):,}")
+    print(f"Permutations: {n_permutations(config):,}")
+    print("Analysis design: dataset-level pooled receivers, one-sided positive/negative tests, BH across LR tests within each KD.")
+    print("Permutation scheme: global spatial shuffle of whole-cell profiles across all positions, then re-derive KD cells and receivers.")
+    if mode == "aggregate":
+        run_aggregate_only()
+        return
+
+    print("Loading MuData...")
+    mdata = md.read_h5mu(H5MU_PATH)
+    rna = mdata.mod["rna"]
+    obs = rna.obs.copy()
+    obs.index = obs.index.astype(str)
+    obs["cell_id"] = obs.index
+    obs["EB"] = obs[EB_COL].astype(str).map(canonicalize_eb)
+    obs["guide_string"] = obs[GUIDE_COL].fillna("").astype(str)
+    coords_all = np.asarray(rna.obsm["X_spatial"], dtype=float)
+    if coords_all.shape != (len(obs), 2) or not np.isfinite(coords_all).all():
+        raise ValueError("Invalid X_spatial coordinates.")
+
+    print("Loading LR long sparse CSV...")
+    lr = resolve_lr_columns(pd.read_csv(LR_PATH, low_memory=False))
+    lr["cell_id"] = lr["cell_id"].astype(str)
+    lr["interaction_id"] = lr["interaction_id"].astype(str)
+    lr["lr_name"] = lr["lr_name"].astype(str)
+    lr["lr_score"] = pd.to_numeric(lr["lr_score"], errors="coerce").fillna(0.0)
+    if "lr_type" not in lr.columns:
+        lr["lr_type"] = "unknown"
+
+    alias_map = build_alias_map(obs)
+    lr["canonical_cell_id"] = lr["cell_id"].map(alias_map)
+    matched = int(lr["canonical_cell_id"].notna().sum())
+    print(f"LR rows matched to MuData cells: {matched:,}/{len(lr):,}")
+    if matched == 0:
+        raise ValueError("No LR CSV cell IDs matched MuData. Inspect LR cell_id format.")
+    lr = lr.dropna(subset=["canonical_cell_id"]).copy()
+
+    if config.mode_name == "direct":
+        annotation_columns = identify_lr_annotation_columns(lr)
+        lr_meta_cols = ["lr_type", "interaction_id"]
+        for column in annotation_columns:
+            if column in lr.columns and column not in lr_meta_cols:
+                lr_meta_cols.append(column)
+        lr_meta = lr[lr_meta_cols].drop_duplicates(subset=["lr_type", "interaction_id"])
+        kd_genes = extract_all_kd_genes(obs)
+        tests = select_direct_tests(lr_meta, kd_genes)
+    else:
+        lr_meta_cols = [c for c in ["lr_type", "interaction_id", "lr_name", "ligand_name", "receptor_name"] if c in lr.columns]
+        lr_meta = lr[lr_meta_cols].drop_duplicates()
+        tests = select_compensatory_tests(lr_meta, config.compensatory_tests)
+
+    tests.to_csv(output_dir / f"selected_{config.mode_name}_KD_LR_tests.csv", index=False)
+    selected_targets = resolve_targets(config, sorted(tests["kd_gene"].unique().tolist()))
+    print(f"Selected KD targets ({len(selected_targets)}): {selected_targets}")
+
+    if config.mode_name == "direct":
+        lr_scores = (
+            lr.groupby(["lr_type", "interaction_id", "canonical_cell_id"], as_index=False)["lr_score"]
+            .mean()
+        )
+        score_groups = {
+            (str(lr_type), str(interaction_id)): group.set_index("canonical_cell_id")["lr_score"]
+            for (lr_type, interaction_id), group in lr_scores.groupby(["lr_type", "interaction_id"])
+        }
+    else:
+        lr_scores = (
+            lr.groupby(["interaction_id", "canonical_cell_id"], as_index=False)["lr_score"]
+            .mean()
+        )
+        score_groups = {
+            str(interaction_id): group.set_index("canonical_cell_id")["lr_score"]
+            for interaction_id, group in lr_scores.groupby("interaction_id")
+        }
+
+    print("Precomputing EB cell indices and pairwise distance matrices...")
+    eb_indices_map: Dict[str, np.ndarray] = {}
+    eb_distance_matrices: Dict[str, np.ndarray] = {}
+    cell_ids_all = obs.index.to_numpy()
+    guide_strings_all = obs["guide_string"].to_numpy()
+    for eb, eb_labels in obs.groupby("EB", sort=True).groups.items():
+        eb_idx = np.asarray([obs.index.get_loc(cell_id) for cell_id in eb_labels], dtype=int)
+        eb_key = str(eb)
+        eb_indices_map[eb_key] = eb_idx
+        eb_distance_matrices[eb_key] = pairwise_distance_matrix(coords_all[eb_idx])
+    print(f"Precomputed pairwise distance matrices for {len(eb_indices_map):,} EBs")
+
+    print("\n" + "#" * 90)
+    print(f"RUNNING DATASET-LEVEL {config.mode_name.upper()} KD x LR ANALYSIS")
+    print("#" * 90)
+
+    for kd_gene in selected_targets:
+        kd_tests = tests[tests["kd_gene"] == kd_gene].copy()
+        if kd_tests.empty:
+            print(f"KD TARGET: {kd_gene} | {config.mode_name.upper()} | no matched tests; skipping")
+            continue
+
+        print("\n" + "=" * 90)
+        print(f"KD TARGET: {kd_gene} | {config.mode_name.upper()}")
+        print("=" * 90)
+
+        dense_columns: List[np.ndarray] = []
+        test_meta_rows: List[dict] = []
+        for test in kd_tests.itertuples(index=False):
+            if config.mode_name == "direct":
+                key = (str(getattr(test, "lr_type", "unknown")), str(test.interaction_id))
+            else:
+                key = str(test.interaction_id)
+            series = score_groups.get(key)
+            if series is None:
+                continue
+            dense_columns.append(series.reindex(cell_ids_all).fillna(0.0).to_numpy(dtype=np.float32))
+            test_meta_rows.append({
+                "mode": config.mode_name,
+                "kd_gene": kd_gene,
+                "lr_type": str(getattr(test, "lr_type", "unknown")),
+                "lr_name": str(test.lr_name),
+                "interaction_id": str(test.interaction_id),
+            })
+
+        if not dense_columns:
+            continue
+
+        dense_scores_all = np.column_stack(dense_columns).astype(np.float32, copy=False)
+        kd_global = np.fromiter(
+            (guide_has_gene(label, kd_gene) for label in guide_strings_all),
+            dtype=bool,
+            count=len(guide_strings_all),
+        )
+
+        observed_receiver_positions: List[np.ndarray] = []
+        observed_distance_chunks: List[np.ndarray] = []
+        eligible_eb_rows: List[dict] = []
+        total_kd = 0
+        total_non_kd = 0
+        for eb_key, eb_idx in eb_indices_map.items():
+            kd_mask = kd_global[eb_idx]
+            n_kd = int(kd_mask.sum())
+            n_non_kd = int((~kd_mask).sum())
+            if n_kd < MIN_KD_CELLS_PER_EB or n_non_kd < MIN_RECEIVERS:
+                continue
+            observed_dist_all = nearest_reference_distances_from_matrix(
+                eb_distance_matrices[eb_key], np.flatnonzero(kd_mask)
+            )
+            observed_receiver_mask = (~kd_mask) & np.isfinite(observed_dist_all) & (observed_dist_all <= MAX_DISTANCE)
+            if int(observed_receiver_mask.sum()) < MIN_RECEIVERS:
+                continue
+            observed_receiver_positions.append(eb_idx[observed_receiver_mask])
+            observed_distance_chunks.append(observed_dist_all[observed_receiver_mask].astype(np.float64, copy=False))
+            eligible_eb_rows.append({
+                "kd_gene": kd_gene,
+                "EB": eb_key,
+                "n_cells": int(len(eb_idx)),
+                "n_kd": n_kd,
+                "n_non_kd": n_non_kd,
+                "n_receivers": int(observed_receiver_mask.sum()),
+            })
+            total_kd += n_kd
+            total_non_kd += n_non_kd
+
+        if not observed_receiver_positions:
+            print("  No eligible EBs with observed receivers; skipping.")
+            continue
+
+        pooled_receiver_positions = np.concatenate(observed_receiver_positions)
+        pooled_observed_dist = np.concatenate(observed_distance_chunks)
+        if pooled_observed_dist.size < MIN_RECEIVERS:
+            print("  Too few pooled observed receivers; skipping.")
+            continue
+
+        observed_scores = dense_scores_all[pooled_receiver_positions]
+        ranked_x_obs, scale_x_obs = centered_rank_vector(pooled_observed_dist)
+        observed_rows: List[dict] = []
+        profile_rows: List[dict] = []
+        for start in range(0, observed_scores.shape[1], TEST_BLOCK_SIZE):
+            stop = min(start + TEST_BLOCK_SIZE, observed_scores.shape[1])
+            block = observed_scores[:, start:stop]
+            rho_block = spearman_rho_block_no_nan(ranked_x_obs, scale_x_obs, block)
+            for local_index in range(block.shape[1]):
+                test_position = start + local_index
+                meta = test_meta_rows[test_position].copy()
+                meta["rho_distance"] = float(rho_block[local_index]) if np.isfinite(rho_block[local_index]) else np.nan
+                meta["n_cells_total"] = int(len(cell_ids_all))
+                meta["n_kd_total_across_eligible_EBs"] = int(total_kd)
+                meta["n_non_kd_total_across_eligible_EBs"] = int(total_non_kd)
+                meta["n_eligible_EBs"] = int(len(eligible_eb_rows))
+                meta["n_receivers_pooled_within_300um"] = int(pooled_observed_dist.size)
+                observed_rows.append(meta)
+
+                profile = bin_profile(pooled_observed_dist, block[:, local_index].astype(float, copy=False))
+                profile["mode"] = config.mode_name
+                profile["kd_gene"] = meta["kd_gene"]
+                profile["lr_type"] = meta["lr_type"]
+                profile["lr_name"] = meta["lr_name"]
+                profile["interaction_id"] = meta["interaction_id"]
+                profile_rows.extend(profile.to_dict("records"))
+
+        observed_results = pd.DataFrame(observed_rows)
+        valid_mask = np.isfinite(observed_results["rho_distance"].to_numpy(dtype=float))
+        observed_results = observed_results.loc[valid_mask].reset_index(drop=True)
+        if observed_results.empty:
+            print("  No valid observed LR tests after ranking checks; skipping.")
+            continue
+
+        dense_scores_all = dense_scores_all[:, np.flatnonzero(valid_mask)]
+        profile_df = pd.DataFrame(profile_rows)
+        if not profile_df.empty:
+            valid_keys = observed_results[["kd_gene", "lr_type", "lr_name", "interaction_id"]].drop_duplicates()
+            profile_df = profile_df.merge(valid_keys, on=["kd_gene", "lr_type", "lr_name", "interaction_id"], how="inner")
+
+        eligible_eb_df = pd.DataFrame(eligible_eb_rows)
+        eligible_eb_path = null_dir / safe_name(f"{kd_gene}__eligible_ebs.csv")
+        eligible_eb_df.to_csv(eligible_eb_path, index=False)
+
+        unit_label = f"{kd_gene}__dataset_level__{config.mode_name}"
+        test_map_path = null_dir / safe_name(f"{unit_label}_test_map.csv")
+        observed_results[["kd_gene", "lr_type", "lr_name", "interaction_id", "rho_distance"]].to_csv(
+            test_map_path, index=False
+        )
+
+        state = initialize_permutation_state(observed_results, dense_scores_all, null_dir, unit_label)
+        for chunk_start in range(0, n_permutations(config), null_chunk_size(config)):
+            chunk_stop = min(chunk_start + null_chunk_size(config), n_permutations(config))
+            chunk_width = chunk_stop - chunk_start
+            chunk_null_rhos = (
+                np.full((len(observed_results), chunk_width), np.nan, dtype=np.float32)
+                if save_full_nulls(config) else None
+            )
+
+            for permutation_index in range(chunk_start, chunk_stop):
+                perm_rng = np.random.default_rng(
+                    stable_seed(SEED, kd_gene, config.mode_name, permutation_index, "global_spatial_shuffle")
+                )
+                perm_order = perm_rng.permutation(len(cell_ids_all))
+                perm_guide_strings = guide_strings_all[perm_order]
+                perm_kd_global = np.fromiter(
+                    (guide_has_gene(label, kd_gene) for label in perm_guide_strings),
+                    dtype=bool,
+                    count=len(perm_guide_strings),
+                )
+
+                perm_receiver_positions: List[np.ndarray] = []
+                perm_distance_chunks: List[np.ndarray] = []
+                for eb_key, eb_idx in eb_indices_map.items():
+                    perm_kd_mask = perm_kd_global[eb_idx]
+                    n_kd = int(perm_kd_mask.sum())
+                    n_non_kd = int((~perm_kd_mask).sum())
+                    if n_kd < MIN_KD_CELLS_PER_EB or n_non_kd < MIN_RECEIVERS:
+                        continue
+                    perm_dist_all = nearest_reference_distances_from_matrix(
+                        eb_distance_matrices[eb_key], np.flatnonzero(perm_kd_mask)
+                    )
+                    perm_receiver_mask = (~perm_kd_mask) & np.isfinite(perm_dist_all) & (perm_dist_all <= MAX_DISTANCE)
+                    if int(perm_receiver_mask.sum()) < MIN_RECEIVERS:
+                        continue
+                    perm_receiver_positions.append(eb_idx[perm_receiver_mask])
+                    perm_distance_chunks.append(perm_dist_all[perm_receiver_mask].astype(np.float64, copy=False))
+
+                if not perm_receiver_positions:
+                    continue
+
+                receiver_positions = np.concatenate(perm_receiver_positions)
+                perm_dist = np.concatenate(perm_distance_chunks)
+                if perm_dist.size < MIN_RECEIVERS:
+                    continue
+
+                ranked_x, scale_x = centered_rank_vector(perm_dist)
+                if not np.isfinite(scale_x) or scale_x == 0.0:
+                    continue
+
+                update_state_for_permutation(
+                    state=state,
+                    score_index=perm_order[receiver_positions],
+                    ranked_x=ranked_x,
+                    scale_x=scale_x,
+                    chunk_column=permutation_index - chunk_start,
+                    chunk_null_rhos=chunk_null_rhos,
+                )
+                if (permutation_index + 1) % 100 == 0:
+                    print(f"  permutation {permutation_index + 1:,}/{n_permutations(config):,}")
+
+            flush_null_chunk(
+                state=state,
+                unit_label=unit_label,
+                chunk_start=chunk_start,
+                chunk_stop=chunk_stop,
+                chunk_null_rhos=chunk_null_rhos,
+            )
+            gc.collect()
+
+        permutation_results = finalize_permutation_state(state)
+        observed_results["p_positive_one_sided"] = permutation_results["p_positive"]
+        observed_results["p_negative_one_sided"] = permutation_results["p_negative"]
+        observed_results["n_permutations_positive_tail"] = permutation_results["positive_tail_counts"]
+        observed_results["n_permutations_negative_tail"] = permutation_results["negative_tail_counts"]
+        observed_results["n_valid_permutations"] = permutation_results["valid_counts"]
+        observed_results["null_rho_file"] = permutation_results["manifest_path"]
+        observed_results["null_rho_chunk_dir"] = permutation_results["chunk_dir"]
+        observed_results["null_test_map_file"] = str(test_map_path)
+        observed_results["eligible_eb_summary_file"] = str(eligible_eb_path)
+        observed_results["full_null_rho_array_shape"] = f"{len(observed_results)}x{n_permutations(config)}"
+        observed_results["full_null_rho_dtype"] = "float32"
+        observed_results["null_chunk_size_permutations"] = null_chunk_size(config)
+
+        observed_results.to_csv(
+            result_dir / f"{safe_name(kd_gene)}_dataset_level_{config.mode_name}_KD_LR_results_RAW.csv",
+            index=False,
+        )
+        if not profile_df.empty:
+            profile_df.to_csv(
+                profile_dir / f"{safe_name(kd_gene)}_dataset_level_{config.mode_name}_KD_LR_bin_profiles_RAW.csv",
+                index=False,
+            )
+        gc.collect()
+
+    if mode == "full":
+        run_aggregate_only()
+
+
+# KD Effect Compensatory
+#!/usr/bin/env python3
+"""
+Dataset-level compensatory KD effect on CytoSignal LR scores.
+
+This wrapper now runs the updated shared analysis:
+  - pooled dataset-level receivers across eligible EBs
+  - global spatial shuffle of whole-cell profiles across all positions
+  - separate positive and negative one-sided empirical p-values
+  - BH-FDR across LR tests within each KD
+"""
+from __future__ import annotations
+
+from kd_lr_ebwise_common import AnalysisConfig, run_analysis
+
+
+COMPENSATORY_TESTS = [
+    ("DLL3", "contact", "DLL1_NOTCH1", "CPI-SS04A5D6B6F"),
+    ("DLL3", "contact", "DLL1_NOTCH2", "CPI-SS0423580E5"),
+    ("DLL3", "contact", "DLL1_NOTCH3", "CPI-SS047232C64"),
+    ("DLL3", "contact", "DLL1_NOTCH4", "CPI-SS0FB5FE587"),
+    ("DLL3", "contact", "DLL4_NOTCH1", "CPI-SS012B7C21D"),
+    ("DLL3", "contact", "DLL4_NOTCH2", "CPI-SS027CDEA08"),
+    ("DLL3", "contact", "DLL4_NOTCH3", "CPI-SS0938C6980"),
+    ("DLL3", "contact", "DLL4_NOTCH4", "CPI-SS00D153A8A"),
+    ("DLL3", "contact", "JAG1_NOTCH1", "CPI-SS0B87FE6E0"),
+    ("DLL3", "contact", "JAG1_NOTCH2", "CPI-SS060B82BBC"),
+    ("DLL3", "contact", "JAG1_NOTCH3", "CPI-SS0B99F22A2"),
+    ("DLL3", "contact", "JAG1_NOTCH4", "CPI-SS0837E9F59"),
+    ("DLL3", "contact", "JAG2_NOTCH1", "CPI-SS08C3D27F7"),
+    ("DLL3", "contact", "JAG2_NOTCH2", "CPI-SS02770D68F"),
+    ("DLL3", "contact", "JAG2_NOTCH3", "CPI-SS0C4D54E39"),
+    ("DLL3", "contact", "JAG2_NOTCH4", "CPI-SS05FEE05CB"),
+    ("DLL3", "contact", "DLK1_NOTCH1", "CPI-SS0A34EE366"),
+    ("DLL3", "contact", "DLK1_NOTCH2", "CPI-SS0E1A8414D"),
+    ("DLL3", "contact", "DLK1_NOTCH3", "CPI-SS007AA9FDE"),
+    ("DLL3", "contact", "DLK1_NOTCH4", "CPI-SS0D37C7C70"),
+    ("JAG1", "contact", "JAG2_NOTCH1", "CPI-SS08C3D27F7"),
+    ("JAG1", "contact", "JAG2_NOTCH2", "CPI-SS02770D68F"),
+    ("JAG1", "contact", "JAG2_NOTCH3", "CPI-SS0C4D54E39"),
+    ("JAG1", "contact", "JAG2_NOTCH4", "CPI-SS05FEE05CB"),
+    ("JAG1", "contact", "DLL1_NOTCH1", "CPI-SS04A5D6B6F"),
+    ("JAG1", "contact", "DLL1_NOTCH2", "CPI-SS0423580E5"),
+    ("JAG1", "contact", "DLL1_NOTCH3", "CPI-SS047232C64"),
+    ("JAG1", "contact", "DLL1_NOTCH4", "CPI-SS0FB5FE587"),
+    ("JAG1", "contact", "DLL3_NOTCH1", "CPI-SS0607D1101"),
+    ("JAG1", "contact", "DLL3_NOTCH2", "CPI-SS003C9A532"),
+    ("JAG1", "contact", "DLL3_NOTCH3", "CPI-SS035E5A708"),
+    ("JAG1", "contact", "DLL3_NOTCH4", "CPI-SS09D379E5B"),
+    ("JAG1", "contact", "DLL4_NOTCH1", "CPI-SS012B7C21D"),
+    ("JAG1", "contact", "DLL4_NOTCH2", "CPI-SS027CDEA08"),
+    ("JAG1", "contact", "DLL4_NOTCH3", "CPI-SS0938C6980"),
+    ("JAG1", "contact", "DLL4_NOTCH4", "CPI-SS00D153A8A"),
+    ("JAG1", "contact", "DLK1_NOTCH1", "CPI-SS0A34EE366"),
+    ("JAG1", "contact", "DLK1_NOTCH2", "CPI-SS0E1A8414D"),
+    ("JAG1", "contact", "DLK1_NOTCH3", "CPI-SS007AA9FDE"),
+    ("JAG1", "contact", "DLK1_NOTCH4", "CPI-SS0D37C7C70"),
+    ("EFNA3", "contact", "EFNA2_EPHA1", "CPI-SS0B34CBA4B"),
+    ("EFNA3", "contact", "EFNA2_EPHA2", "CPI-SS08A54963F"),
+    ("EFNA3", "contact", "EFNA2_EPHA4", "CPI-SS0E63AB61E"),
+    ("EFNA3", "contact", "EFNA5_EPHA5", "CPI-SS09E3F5044"),
+    ("EFNA3", "contact", "EFNA5_EPHA7", "CPI-SS028688B7B"),
+    ("EFNA3", "contact", "EFNA5_EPHA8", "CPI-SS012CCE326"),
+    ("NECTIN3", "contact", "TIGIT_NECTIN2", "CPI-SS0A5DF05C0"),
+    ("B2M", "contact", "HLA-E_KLRD1", "CPI-CS0023FA839;CPI-CS05AB368CE;CPI-CS0715DE78D"),
+    ("B2M", "contact", "HLA-E_KLRC1", "CPI-CS0715DE78D;CPI-SS03EF699C7"),
+    ("B2M", "contact", "HLA-E_KLRC2", "CPI-CS05AB368CE;CPI-SS0C4FA643F"),
+    ("B2M", "contact", "HLA-E_KLRC3", "CPI-CS0023FA839"),
+    ("B2M", "contact", "HLA-E_KLRK1", "CPI-SS03339363E"),
+    ("B2M", "contact", "HLA-F_KIR3DL1", "CPI-SS048242083"),
+    ("B2M", "contact", "HLA-F_KIR3DL2", "CPI-SS0BDD10277"),
+    ("B2M", "contact", "HLA-F_LILRB2", "CPI-SS0A76A8E97"),
+    ("B2M", "contact", "CD1D_LILRB2", "CPI-SS0EAB03260"),
+]
+
+
+if __name__ == "__main__":
+    run_analysis(
+        AnalysisConfig(
+            mode_name="compensatory",
+            env_prefix="KD_COMP_EB",
+            output_name="KD_LR_COMPENSATORY_SELECTED_KDs_DATASET_LEVEL_GLOBAL_SPATIAL_SHUFFLE_100K_ONE_SIDED",
+            compensatory_tests=COMPENSATORY_TESTS,
+        )
+    )
+
+
+# KD Effect Direct
+#!/usr/bin/env python3
+"""
+Dataset-level direct KD effect on CytoSignal LR scores.
+
+This wrapper now runs the updated shared analysis:
+  - pooled dataset-level receivers across eligible EBs
+  - global spatial shuffle of whole-cell profiles across all positions
+  - separate positive and negative one-sided empirical p-values
+  - BH-FDR across LR tests within each KD
+"""
+from __future__ import annotations
+
+from kd_lr_ebwise_common import AnalysisConfig, run_analysis
+
+
+if __name__ == "__main__":
+    run_analysis(
+        AnalysisConfig(
+            mode_name="direct",
+            env_prefix="KD_DIRECT_EB",
+            output_name="KD_LR_DIRECT_MATCHED_KDs_DATASET_LEVEL_GLOBAL_SPATIAL_SHUFFLE_100K_ONE_SIDED",
+            compensatory_tests=[],
+        )
+    )
