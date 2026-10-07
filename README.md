@@ -1,25 +1,6 @@
 # Perturb-Tags Analysis Notebooks
 
-Reproducible analysis notebooks for the Perturb-Tags spatial multiome experiment.
-
-## Data
-
-All data is downloaded from Google Drive when running the notebooks. The following files are used:
-
-### Multiome data (ligand/receptor analyses)
-| File | Google Drive ID | Description | Size |
-|------|----------------|-------------|------|
-| `all_lanes_CATATAC.h5mu` | `1NZzzEX9zHSj5Cp5ewuHRataW0jkIA-bo` | Multiome (RNA + ATAC + ChromVAR), 17,043 cells | ~615 MB |
-| `aggregated_TE_RNA.h5ad` | `1PU3dJ0n3siOUqt67knTc3mXWe1k1gROV` | TE family RNA expression (CPM) | ~16 MB |
-| `aggregated_TE_ATAC.h5ad` | `1H_7eV_ZynrXNHy0P9YAb66aTWLA9fvIg` | TE family ATAC accessibility (CPM) | ~130 MB |
-
-### Kinase perturbation slides
-| File | Google Drive ID | Description | Size |
-|------|----------------|-------------|------|
-| `slide1_manual_EBs.h5ad` | `11IA4l5KVsvGCq0BjdQ7DCCzWOWfjme-n` | Slide 1, 2,583 cells | ~23 MB |
-| `slide2_manual_EBs.h5ad` | `1lwxZkS6cAZbcAEeI6OqJn2qxmpFFAs2B` | Slide 2, 11,908 cells | ~283 MB |
-| `slide3_manual_EBs.h5ad` | `15CCMZzP0EBN7EvGSlu3mgj_wuZq6eTL3` | Slide 3, 5,213 cells | ~123 MB |
-| `slide4_manual_EBs.h5ad` | `1M9RhXsbqSvOZbsGKTxeZ88gDxHmeqaav` | Slide 4, 3,659 cells | ~85 MB |
+Reproducible analysis notebooks for analyses of the Perturb-Tags datasets.
 
 ## Notebooks
 
