@@ -1084,3 +1084,107 @@ if __name__ == "__main__":
             compensatory_tests=[],
         )
     )
+
+
+# Spatial map
+import os,re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+GUIDE="EFNA3"
+LR_SCORE_NAME="EFNA3_EPHA1"
+LR_MODE="contact"  # "contact" or "diffusion"
+LR_SCORE_CSV="all_EB_contact_diffusion_LR_scores_LONG_sparse_WITH_lr_name.csv"
+GUIDE_COLUMN="guides_passing_str"
+SPATIAL_KEY="spatial"
+RADIUS=200
+SCALE_BAR_UM=200
+PLOTTED_CELL_DIAMETER_UM=13.73
+SAVE_FIGURES=True
+SHOW_FIGURES=True
+output_dir="LR_score_spatial_maps"
+os.makedirs(output_dir,exist_ok=True)
+def safe_name(x):
+    return re.sub(r"[^A-Za-z0-9_.-]+","_",str(x)).strip("_")
+def find_col(df,names):
+    lower={str(c).lower():c for c in df.columns}
+    for x in names:
+        if x.lower() in lower:
+            return lower[x.lower()]
+    for x in names:
+        for c in df.columns:
+            if x.lower() in str(c).lower():
+                return c
+    raise ValueError(f"Column not found. Available columns: {df.columns.tolist()}")
+def guide_mask(adata,guide):
+    labels=adata.obs[GUIDE_COLUMN].fillna("").astype(str)
+    return labels.str.split(r"[;|]").apply(
+        lambda xs:any(
+            x.strip()==guide or x.strip().startswith(f"{guide}-")
+            for x in xs
+        )
+    ).to_numpy()
+if not GUIDE:
+    raise ValueError("Fill in GUIDE")
+if not LR_SCORE_NAME:
+    raise ValueError("Fill in LR_SCORE_NAME")
+lr=pd.read_csv(LR_SCORE_CSV)
+cell_col=find_col(lr,["cell_id","cell","barcode","barcodes","spot_id","obs_name"])
+lr_col=find_col(lr,["lr_name","ligand_receptor","interaction_name","interaction"])
+score_col=find_col(lr,["score","lr_score","value","interaction_score"])
+lr=lr[lr[lr_col].astype(str).str.strip().eq(LR_SCORE_NAME)].copy()
+if LR_MODE:
+    mode_col=find_col(lr,["mode","type","method","score_type","contact_diffusion"])
+    lr=lr[lr[mode_col].astype(str).str.lower().eq(LR_MODE.lower())].copy()
+if lr.empty:
+    raise ValueError(f"No rows found for {LR_SCORE_NAME}")
+lr[score_col]=pd.to_numeric(lr[score_col],errors="coerce")
+lr=lr.dropna(subset=[cell_col,score_col])
+lr[cell_col]=lr[cell_col].astype(str).str.strip()
+score_lookup=lr.groupby(cell_col)[score_col].mean().to_dict()
+cell_ids=pd.Index(adata.obs_names.astype(str).str.strip())
+scores=np.array([score_lookup.get(x,0.0) for x in cell_ids],dtype=float)
+if np.sum(cell_ids.isin(score_lookup.keys()))==0:
+    raise ValueError("CSV cell IDs do not match adata.obs_names")
+coords=np.asarray(adata.obsm[SPATIAL_KEY],float)[:,:2]
+pert_idx=np.where(guide_mask(adata,GUIDE))[0]
+if len(pert_idx)==0:
+    raise ValueError(f"No cells found for guide {GUIDE}")
+positive=scores[np.isfinite(scores)&(scores>0)]
+vmin=0
+vmax=np.nanpercentile(positive,99) if len(positive) else np.nanmax(scores)
+if not np.isfinite(vmax) or vmax<=0:
+    vmax=1
+fig,ax=plt.subplots(figsize=(8.6,7.6),dpi=300)
+p=ax.scatter(coords[:,0],coords[:,1],c=scores,s=1.2,cmap="viridis",vmin=vmin,vmax=vmax,linewidths=0,alpha=.95,rasterized=True)
+ax.scatter(coords[pert_idx,0],coords[pert_idx,1],s=5.5,color="red",linewidths=0,alpha=.95,rasterized=True)
+ax.set_title(f"{GUIDE} — ALL cells — {LR_MODE+' — ' if LR_MODE else ''}{LR_SCORE_NAME}\nradius = {RADIUS} µm",pad=10)
+ax.set_xlabel("X (µm)")
+ax.set_ylabel("Y (µm)")
+ax.set_aspect("equal")
+ax.grid(False)
+x0,x1=ax.get_xlim()
+y0,y1=ax.get_ylim()
+xr=x1-x0
+yr=y1-y0
+bx=x0+.03*xr
+by=y0+.035*yr
+ax.plot([bx,bx+SCALE_BAR_UM],[by,by],color="black",linewidth=2)
+ax.text(bx,by+.025*yr,f"{SCALE_BAR_UM} µm",ha="left",va="bottom",fontsize=11)
+legend=[
+    Line2D([0],[0],marker="o",color="none",markerfacecolor=".35",markeredgecolor="none",markersize=3,label=f"Cell diameter ≈ {PLOTTED_CELL_DIAMETER_UM:.2f} µm"),
+    Line2D([0],[0],marker="o",color="none",markerfacecolor="red",markeredgecolor="none",markersize=4,label=f"{GUIDE} cells")
+]
+ax.legend(handles=legend,frameon=False,loc="lower right")
+cbar=fig.colorbar(p,ax=ax,fraction=.035,pad=.04)
+cbar.set_label(f"{LR_SCORE_NAME} ({LR_MODE+' ' if LR_MODE else ''}LR score)",fontsize=11)
+plt.tight_layout()
+fname=safe_name(f"{GUIDE}_{LR_MODE}_{LR_SCORE_NAME}_LR_spatial")
+if SAVE_FIGURES:
+    fig.savefig(os.path.join(output_dir,f"{fname}.png"),dpi=600,bbox_inches="tight")
+    fig.savefig(os.path.join(output_dir,f"{fname}.pdf"),bbox_inches="tight")
+if SHOW_FIGURES:
+    plt.show()
+else:
+    plt.close(fig)
