@@ -6,7 +6,7 @@ Reproducible analysis scripts and notebooks used to generate the analyses presen
 
 ### Figure 1
 
-#### `Belayer (HMM) Spatial Guide Clustering (Fig.1 e)`
+#### `Belayer (HMM) Spatial Guide Clustering`
 
 Spatial guide-clustering analysis used for Figure 1e.
 
@@ -14,7 +14,7 @@ Spatial guide-clustering analysis used for Figure 1e.
 - Spatial organization of guide-positive cells within individual EBs
 - Identification and visualization of spatial perturbation clones
 
-#### `distance_dependent_expression (Fig 1)`
+#### `distance_dependent_expression`
 
 Distance-dependent receiver-cell expression analysis used for Figure 1.
 
@@ -27,7 +27,7 @@ Distance-dependent receiver-cell expression analysis used for Figure 1.
 
 ### Figure 2
 
-#### `KD_effect_direct_compensatory_fig2`
+#### `KD_effect_direct_compensatory`
 
 Ligand-receptor analysis used to generate Figure 2.
 
@@ -40,7 +40,7 @@ Ligand-receptor analysis used to generate Figure 2.
 
 ### Figure 3
 
-#### `multimodal_gp_50kb_fig3.py`
+#### `multimodal_gp_50kb.py`
 
 Multimodal Gaussian-process analysis used for Figure 3.
 
@@ -50,7 +50,7 @@ Multimodal Gaussian-process analysis used for Figure 3.
 - Uses Benjamini-Hochberg FDR correction to identify significant distance-dependent regulatory features
 - Generates representative spatial regulatory trajectories and multimodal GP summaries
 
-#### `receptor_interaction_analysis_Fig3.ipynb`
+#### `receptor_interaction_analysis.ipynb`
 
 Receptor KD × ligand microenvironment interaction analysis associated with the Figure 3 spatial signaling analyses.
 
@@ -60,7 +60,7 @@ Receptor KD × ligand microenvironment interaction analysis associated with the 
 - Vectorized OLS model: `expression ~ KD + ligand + KD×ligand`
 - FDR correction across tested interactions
 
-#### `SCENIC_figure3i.ipynb`
+#### `SCENIC.ipynb`
 
 Regulatory-network analysis used for Figure 3i.
 
@@ -72,7 +72,7 @@ Regulatory-network analysis used for Figure 3i.
 
 ### Figure 4
 
-#### `KD_effect_Cell_type_Figure4_abc_efg_analysis.py`
+#### `KD_effect_Cell_type_analysis.py`
 
 Cell-state and spatial analyses used for Figure 4a-c and Figure 4e-g.
 
@@ -82,7 +82,7 @@ Cell-state and spatial analyses used for Figure 4a-c and Figure 4e-g.
 - Targeted pre-ranked gene-set enrichment analysis
 - Common-coordinate spatial registration and visualization of perturbation-associated cell-state distributions
 
-#### `kd_distance_ebwise_common_four_modalities_Figure4d.py`
+#### `kd_distance_ebwise_common_four_modalities.py`
 
 Distance-dependent multimodal analysis used for Figure 4d.
 
@@ -95,7 +95,7 @@ Distance-dependent multimodal analysis used for Figure 4d.
 
 ### Figure 5
 
-#### `kinase_perturbation_qc_Fig5.ipynb`
+#### `kinase_perturbation_qc.ipynb`
 
 QC, spatial-distribution, and perturbation-summary analyses used for the kinase screen in Figure 5.
 
@@ -146,7 +146,7 @@ CytoSignal ligand-receptor scoring for the receptor/multiome dataset.
 - Computes LR scores at 100, 200, and 400 µm diffusion scales
 - Provides spatial signaling features for the receptor-context analyses described in the Methods
 
-#### `Receptor_CytoSignal_LR_ElasticNet_Screen_Methods_fig5.ipynb`
+#### `Receptor_CytoSignal_LR_ElasticNet_Screen.ipynb`
 
 Receptor-context ElasticNet analysis corresponding to the interaction-modeling framework described with the Figure 5 analyses.
 
@@ -154,7 +154,7 @@ Receptor-context ElasticNet analysis corresponding to the interaction-modeling f
 - Identifies candidate spatial ligand-receptor interactions for downstream testing
 - Provides the receptor counterpart to the kinase interaction-screening workflow
 
-#### `Receptor_CytoSignal_TopLR_GeneLevel_OLS_Methods_fig5.ipynb`
+#### `Receptor_CytoSignal_TopLR_GeneLevel_OLS.ipynb`
 
 Gene-level receptor KD × ligand-receptor interaction analysis corresponding to the Figure 5 Methods framework.
 
@@ -174,7 +174,7 @@ Spatial visualization of receptor KD × ligand-receptor context effects.
 
 ### Figure 6
 
-#### `Multimodal_GAT_fig6.py`
+#### `Multimodal_GAT.py`
 
 Multimodal graph-attention-network training and evaluation used for Figure 6.
 
@@ -187,7 +187,7 @@ Multimodal graph-attention-network training and evaluation used for Figure 6.
 - Generates the RNA and ATAC prediction-performance analyses used in Figure 6c
 - Produces the trained models used for the downstream Figure 6d-g counterfactual analyses
 
-#### `Inference_Figure6d_g.py`
+#### `Inference.py`
 
 Post-training GAT inference and counterfactual analyses used for Figure 6d-g.
 
