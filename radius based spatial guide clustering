@@ -6,7 +6,7 @@ from scipy.spatial import KDTree
 from scipy.spatial.distance import pdist
 import matplotlib.pyplot as plt
 
-DATA_PATH = 'adata_withEBclusters.h5ad' 
+DATA_PATH = 'adata_filtered_processed_EB_cluster_manual.h5ad' 
 RADIUS_VALUES = [50, 100, 150, 200, 300, 500]
 REFERENCE_RADIUS = 100
 N_PERMUTATIONS = 999
@@ -299,6 +299,7 @@ print("  spatial_lineage_clone_size_distributions.png")
 print("  clone_radius_summary.csv")
 print(f"  clone_components_radius_{REFERENCE_RADIUS}.csv")
 print(f"  clone_target_summary_radius_{REFERENCE_RADIUS}.csv")
+
 ref_components = component_tables[REFERENCE_RADIUS].copy()
 
 # expand targets
@@ -349,3 +350,424 @@ def plot_target_components(target):
 
 for t in top_targets[:3]:
     plot_target_components(t)
+
+# Multi-guide Spatial overlap
+def plot_multi_targets(targets):
+    plt.figure(figsize=(6,6))
+
+    plt.scatter(spatial[:,0], spatial[:,1], s=1, c='lightgray', alpha=0.2)
+
+    colors = ['red','blue']
+
+    for t, c in zip(targets, colors):
+        mask = adata.obs['guides_passing_str'].str.contains(t, na=False)
+        idx = np.where(mask)[0]
+
+        plt.scatter(spatial[idx,0], spatial[idx,1],
+                    s=0.2, color=c, alpha=0.7, label=t)
+
+    plt.legend()
+    plt.title("Multi-guide spatial overlap")
+    plt.gca().set_aspect('equal')
+    plt.xlabel("X"); plt.ylabel("Y")
+    plt.axis('off')  
+    plt.show()
+plot_multi_targets(top_targets[:2])
+
+#Clone patches spatial map
+def plot_clone_components_for_combo(combo):
+    plt.figure(figsize=(6,6))
+    plt.scatter(spatial[:,0], spatial[:,1], s=1, c='lightgray', alpha=0.15)
+
+    # find components with this combo
+    comps = ref_components[ref_components['guide_combination'] == combo]
+
+    colors = plt.cm.tab20(np.linspace(0,1,20))
+
+    for i, row in enumerate(comps.itertuples()):
+        cells = row.cell_barcodes.split(';')
+        idx = np.where(adata.obs_names.isin(cells))[0]
+
+        plt.scatter(spatial[idx,0], spatial[idx,1],
+                    s=0.1, color=colors[i % 20], alpha=0.85)
+
+    plt.title(f"Clone patches: {combo}")
+    plt.gca().set_aspect('equal')
+    plt.axis('off')  
+    plt.show()
+
+top_combo = "EFNA3-2;NECTIN2-3"
+plot_clone_components_for_combo(top_combo)
+
+# Clone-size analysis by gRNA/gRNA combo
+RADIUS = REFERENCE_RADIUS
+guides_str = adata.obs["guides_passing_str"].fillna("").astype(str).values
+spatial = np.asarray(adata.obsm["spatial"])
+
+perturbed_mask = guides_str != ""
+perturbed_idx = np.where(perturbed_mask)[0]
+
+spatial_perturbed = spatial[perturbed_idx]
+guides_perturbed = guides_str[perturbed_idx]
+
+print(f"Perturbed cells: {len(perturbed_idx)}")
+print(f"Unique exact guide combinations: {pd.Series(guides_perturbed).nunique()}")
+
+# Build clone graph
+# Connect 2 cells if they are within radius and their guide combo string is the same
+tree = KDTree(spatial_perturbed)
+pairs = list(tree.query_pairs(r=RADIUS))
+
+G = nx.Graph()
+G.add_nodes_from(range(len(perturbed_idx)))
+
+edge_count = 0
+
+for i, j in pairs:
+    if guides_perturbed[i] == guides_perturbed[j]:
+        d = np.linalg.norm(spatial_perturbed[i] - spatial_perturbed[j])
+        w = np.exp(-d / ALPHA)
+        G.add_edge(i, j, weight=w)
+        edge_count += 1
+
+print(f"Radius: {RADIUS}")
+print(f"Edges: {edge_count}")
+
+
+components = list(nx.connected_components(G))
+
+clone_records = []
+
+for clone_id, comp in enumerate(components):
+    nodes = sorted(list(comp))
+    global_cells = perturbed_idx[nodes]
+
+    guide_combo = guides_perturbed[nodes[0]]
+
+    clone_records.append({
+        "clone_id": clone_id,
+        "guide_combination": guide_combo,
+        "clone_size": len(nodes),
+        "cell_barcodes": ";".join(adata.obs_names[global_cells])
+    })
+
+clone_df = pd.DataFrame(clone_records)
+clone_df_multi = clone_df[clone_df["clone_size"] > 1].copy()
+
+print(f"Total connected components / clones: {len(clone_df)}")
+print(f"Multi-cell clones: {len(clone_df_multi)}")
+print(f"Cells in multi-cell clones: {clone_df_multi['clone_size'].sum()}")
+clone_df_multi.head()
+
+
+#Plot for Figure 1g
+TOP_N = 10
+top_combos = (
+    clone_df_multi.groupby("guide_combination")["clone_size"]
+    .sum()
+    .sort_values(ascending=False)
+    .head(TOP_N)
+    .index
+)
+
+plot_df = clone_df_multi[
+    clone_df_multi["guide_combination"].isin(top_combos)
+].copy()
+
+combo_order = (
+    plot_df.groupby("guide_combination")["clone_size"]
+    .sum()
+    .sort_values(ascending=False)
+    .index
+)
+
+box_data = [
+    plot_df.loc[plot_df["guide_combination"] == combo, "clone_size"].values
+    for combo in combo_order
+]
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.linewidth": 1.1,
+    "axes.labelsize": 12,
+    "axes.titlesize": 13,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 10,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none"
+})
+
+palette = [
+    "#4C72B0",  # muted blue
+    "#DD8452",  # muted orange
+    "#55A868",  # muted green
+    "#C44E52",  # muted red
+    "#8172B3",  # muted purple
+    "#937860",  # brown
+    "#DA8BC3",  # muted pink
+    "#8C8C8C",  # gray
+    "#64B5CD",  # cyan
+    "#CCB974",  # sand
+    "#2C7FB8",  # deep blue
+    "#7FC97F",  # soft green
+    "#BEAED4",  # lavender
+    "#FDC086",  # peach
+    "#FFFF99",  # pale yellow
+]
+
+colors = [palette[i % len(palette)] for i in range(len(combo_order))]
+spacing_factor = 0.42
+box_width = 0.30
+jitter_width = 0.105
+
+x_positions = np.arange(len(combo_order)) * spacing_factor
+
+fig, ax = plt.subplots(figsize=(6.8, 5.4))
+# Boxplots
+box = ax.boxplot(
+    box_data,
+    positions=x_positions,
+    widths=box_width,
+    showfliers=False,
+    patch_artist=True,
+    boxprops=dict(linewidth=1.15),
+    medianprops=dict(color="black", linewidth=1.35),
+    whiskerprops=dict(color="black", linewidth=1.0),
+    capprops=dict(color="black", linewidth=1.0)
+)
+
+for patch, color in zip(box["boxes"], colors):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.55)
+    patch.set_edgecolor("black")
+
+rng = np.random.default_rng(seed=1)
+
+for x, combo, color in zip(x_positions, combo_order, colors):
+    sub = plot_df[plot_df["guide_combination"] == combo]
+
+    jitter = rng.uniform(-jitter_width, jitter_width, size=len(sub))
+
+    ax.scatter(
+        np.full(len(sub), x) + jitter,
+        sub["clone_size"],
+        s=30,
+        color=color,
+        edgecolor="black",
+        linewidth=0.35,
+        alpha=0.9,
+        zorder=3
+    )
+
+ax.set_xticks(x_positions)
+ax.set_xticklabels(
+    combo_order,
+    rotation=90,
+    ha="center",
+    va="top"
+)
+
+ax.set_ylabel("Number of cells per clone")
+ax.set_xlabel("Exact gRNA combination")
+ax.set_title(
+    f"Clone sizes for top {TOP_N} exact gRNA combinations\n"
+    f"Each dot = one connected component clone, radius = {RADIUS}",
+    pad=12
+)
+
+ax.grid(False)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.spines["left"].set_linewidth(1.1)
+ax.spines["bottom"].set_linewidth(1.1)
+
+ax.tick_params(
+    axis="both",
+    which="major",
+    direction="out",
+    length=4,
+    width=1.0
+)
+
+ax.set_xlim(x_positions[0] - 0.28, x_positions[-1] + 0.28)
+fig.tight_layout()
+plt.show()
+
+
+# Plot for figure 1e
+TOP_N = 10
+cell_type_col = "cell_type"
+
+if cell_type_col not in adata.obs.columns:
+    raise ValueError(
+        f"{cell_type_col} not found in adata.obs. "
+        f"Available columns include: {list(adata.obs.columns)}"
+    )
+top_combos = (
+    clone_df_multi.groupby("guide_combination")["clone_size"]
+    .sum()
+    .sort_values(ascending=False)
+    .head(TOP_N)
+    .index
+)
+
+top_clone_df = clone_df_multi[
+    clone_df_multi["guide_combination"].isin(top_combos)
+].copy()
+
+combo_order = (
+    top_clone_df.groupby("guide_combination")["clone_size"]
+    .sum()
+    .sort_values(ascending=False)
+    .index
+)
+
+# Expand clone_df_multi so each row is one cell in a clone
+cell_records = []
+
+for row in top_clone_df.itertuples():
+    barcodes = row.cell_barcodes.split(";")
+
+    for barcode in barcodes:
+        cell_records.append({
+            "clone_id": row.clone_id,
+            "guide_combination": row.guide_combination,
+            "clone_size": row.clone_size,
+            "cell_barcode": barcode,
+            "cell_type": adata.obs.loc[barcode, cell_type_col]
+        })
+
+clone_cell_df = pd.DataFrame(cell_records)
+clone_cell_df["cell_type"] = clone_cell_df["cell_type"].astype(str)
+
+
+# Count cell types per gRNA
+stack_df = (
+    clone_cell_df
+    .groupby(["guide_combination", "cell_type"])
+    .size()
+    .reset_index(name="n_cells")
+)
+
+stack_matrix = (
+    stack_df
+    .pivot(index="guide_combination", columns="cell_type", values="n_cells")
+    .reindex(index=combo_order)
+    .fillna(0)
+)
+
+cell_type_order = [
+    "Pluripotent",
+    "Neural Crest",
+    "Endoderm",
+    "Early Ectoderm",
+    "Neurons",
+    "Mesoderm"
+]
+
+cell_type_order = [
+    ct for ct in cell_type_order if ct in stack_matrix.columns
+] + [
+    ct for ct in stack_matrix.columns if ct not in cell_type_order
+]
+
+stack_matrix = stack_matrix[cell_type_order]
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.linewidth": 1.1,
+    "axes.labelsize": 12,
+    "axes.titlesize": 13,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+    "legend.title_fontsize": 10,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none"
+})
+
+cell_type_colors = {
+    "Pluripotent": "#1f77b4",     
+    "Neural Crest": "#ff7f0e",    
+    "Endoderm": "#2ca02c",        
+    "Early Ectoderm": "#d62728",  
+    "Neurons": "#A142F4",         
+    "Mesoderm": "#8c564b"         
+}
+
+fallback_palette = [
+    "#8C8C8C",
+    "#64B5CD",
+    "#CCB974",
+    "#DA8BC3",
+    "#7FC97F",
+    "#BEAED4"
+]
+
+colors = [
+    cell_type_colors.get(cell_type, fallback_palette[i % len(fallback_palette)])
+    for i, cell_type in enumerate(stack_matrix.columns)
+]
+
+spacing_factor = 0.42
+bar_width = 0.30
+x_positions = np.arange(len(stack_matrix.index)) * spacing_factor
+fig, ax = plt.subplots(figsize=(12.4, 5.4))
+bottom = np.zeros(len(stack_matrix))
+for cell_type, color in zip(stack_matrix.columns, colors):
+    values = stack_matrix[cell_type].values
+    ax.bar(
+        x_positions,
+        values,
+        bottom=bottom,
+        width=bar_width,
+        label=cell_type,
+        color=color,
+        edgecolor="white",
+        linewidth=0.45
+    )
+
+    bottom += values
+
+ax.set_xticks(x_positions)
+ax.set_xticklabels(
+    stack_matrix.index,
+    rotation=90,
+    ha="center",
+    va="top"
+)
+ax.set_ylabel("Number of clone cells")
+ax.set_xlabel("Exact gRNA combination")
+ax.set_title(
+    f"Cell-type composition of clone cells for top {TOP_N} gRNA combinations\n"
+    f"Connected components defined by exact guide-combination matching, radius = {RADIUS}",
+    pad=12
+)
+
+ax.grid(False)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.spines["left"].set_linewidth(1.1)
+ax.spines["bottom"].set_linewidth(1.1)
+ax.tick_params(
+    axis="both",
+    which="major",
+    direction="out",
+    length=4,
+    width=1.0
+)
+ax.set_xlim(x_positions[0] - 0.28, x_positions[-1] + 0.28)
+ax.legend(
+    title=cell_type_col,
+    bbox_to_anchor=(1.02, 1),
+    loc="upper left",
+    frameon=False,
+    handlelength=1.0,
+    handletextpad=0.5,
+    borderaxespad=0.0
+)
+fig.tight_layout()
+plt.show()
